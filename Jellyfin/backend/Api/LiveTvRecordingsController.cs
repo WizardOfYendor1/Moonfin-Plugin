@@ -27,7 +27,10 @@ public class LiveTvRecordingsController : ControllerBase
         _service = service;
     }
 
-    /// <summary>The incomplete state of each listed item. Items that aren't incomplete are left out.</summary>
+    /// <summary>
+    /// The incomplete state of each listed item, or of every incomplete item when none are listed.
+    /// Items that aren't incomplete are left out.
+    /// </summary>
     [HttpGet("Recordings/Incomplete")]
     [Authorize(Policy = LiveTvAccess)]
     [ProducesResponseType(StatusCodes.Status200OK)]
@@ -42,7 +45,7 @@ public class LiveTvRecordingsController : ControllerBase
             .Take(500)
             .ToList();
 
-        return Ok(await _service.GetStatesAsync(ids, cancellationToken).ConfigureAwait(false));
+        return Ok(await _service.GetStatesAsync(ids.Count > 0 ? ids : null, cancellationToken).ConfigureAwait(false));
     }
 
     /// <summary>Keep as Complete: dismisses the item's incomplete record for everyone and removes its tag.</summary>

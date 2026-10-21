@@ -258,15 +258,21 @@ public sealed class IncompleteRecordingService : IDisposable
         }
     }
 
-    /// <summary>The display state of each incomplete item among the given ones; complete items are left out.</summary>
-    public async Task<IReadOnlyList<IncompleteRecordingStateDto>> GetStatesAsync(IEnumerable<Guid> itemIds, CancellationToken cancellationToken)
+    /// <summary>
+    /// The display state of each incomplete item among the given ones, or of every incomplete item
+    /// when none are given. Complete items are left out.
+    /// </summary>
+    public async Task<IReadOnlyList<IncompleteRecordingStateDto>> GetStatesAsync(IEnumerable<Guid>? itemIds, CancellationToken cancellationToken)
     {
         await _lock.WaitAsync(cancellationToken).ConfigureAwait(false);
         try
         {
             var data = Load();
             var result = new List<IncompleteRecordingStateDto>();
-            foreach (var itemId in itemIds.Distinct())
+            var ids = itemIds?.ToList() is { Count: > 0 } given
+                ? given
+                : data.Records.Where(r => !r.Dismissed).SelectMany(r => r.ItemIds).ToList();
+            foreach (var itemId in ids.Distinct())
             {
                 var record = data.Records.FirstOrDefault(r => !r.Dismissed && r.ItemIds.Contains(itemId));
                 if (record == null)

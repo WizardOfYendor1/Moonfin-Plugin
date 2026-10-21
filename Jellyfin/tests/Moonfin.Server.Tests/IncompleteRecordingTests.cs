@@ -611,6 +611,20 @@ public sealed class IncompleteRecordingTests : IDisposable
     }
 
     [Fact]
+    public async Task WithoutItemIdsEveryIncompleteItemIsReturned()
+    {
+        var item = new LibraryItem { Id = Guid.NewGuid(), Path = "/rec/a.ts" };
+        _host.Items.Add(item);
+        var service = await RecordAiring(0, 20);
+
+        var state = Assert.Single(await service.GetStatesAsync(null, CancellationToken.None));
+        Assert.Equal(item.Id.ToString("N"), state.ItemId);
+
+        await service.DismissAsync(item.Id, CancellationToken.None);
+        Assert.Empty(await service.GetStatesAsync(null, CancellationToken.None));
+    }
+
+    [Fact]
     public async Task ACompleteReplacementMarksTheRequestRecorded()
     {
         var later = AddAiring("p2", Start.AddDays(1));
