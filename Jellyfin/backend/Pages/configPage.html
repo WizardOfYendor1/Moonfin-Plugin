@@ -1055,6 +1055,29 @@
                     </div>
 
                     <div class="verticalSection">
+                        <h3 class="sectionTitle">Live TV Recordings</h3>
+                        <div class="checkboxContainer">
+                            <label>
+                                <input type="checkbox" id="LiveTvAutoRecordCompleteShowing" is="emby-checkbox" />
+                                <span>Re-record incomplete episodes automatically</span>
+                            </label>
+                            <div class="fieldDescription">
+                                When a recording comes out incomplete, schedule the earliest later showing of the same
+                                episode. Incomplete recordings are tagged DVRIncompleteRecording either way, and nothing
+                                is ever deleted.
+                            </div>
+                        </div>
+                        <div class="inputContainer">
+                            <label class="inputLabel inputLabelUnfocused" for="LiveTvIncompleteThresholdPercent">Incomplete below (% of scheduled length)</label>
+                            <input type="number" id="LiveTvIncompleteThresholdPercent" is="emby-input" min="50" max="100" step="1" />
+                            <div class="fieldDescription">
+                                A recording written for less than this share of its scheduled length, padding included,
+                                is incomplete (default 90).
+                            </div>
+                        </div>
+                    </div>
+
+                    <div class="verticalSection">
                         <h3 class="sectionTitle">TMDB Integration</h3>
                         <div class="inputContainer">
                             <label class="inputLabel inputLabelUnfocused" for="TmdbApiKey">Server-wide TMDB API Key</label>
@@ -6725,6 +6748,8 @@
                     document.querySelector('#RecommendationsProviderEnabled').checked = config.RecommendationsProviderEnabled !== false;
                     document.querySelector('#StudioLogosEnabled').checked = config.StudioLogosEnabled !== false;
                     document.querySelector('#StudioLogosMaxAgeDays').value = config.StudioLogosMaxAgeDays || 30;
+                    document.querySelector('#LiveTvAutoRecordCompleteShowing').checked = config.LiveTvAutoRecordCompleteShowing === true;
+                    document.querySelector('#LiveTvIncompleteThresholdPercent').value = config.LiveTvIncompleteThresholdPercent || 90;
                     document.querySelector('#AnimeMarkersEnabled').checked = config.AnimeMarkersEnabled === true;
                     document.querySelector('#AnimeMarkerRecapLookup').checked = config.AnimeMarkerRecapLookup !== false;
                     document.querySelector('#AnimeAudioMarkersEnabled').checked = config.AnimeAudioMarkersEnabled === true;
@@ -7512,6 +7537,8 @@
                         config.RecommendationsProviderEnabled = document.querySelector('#RecommendationsProviderEnabled').checked;
                         config.StudioLogosEnabled = document.querySelector('#StudioLogosEnabled').checked;
                         config.StudioLogosMaxAgeDays = parseInt(document.querySelector('#StudioLogosMaxAgeDays').value, 10) || 30;
+                        config.LiveTvAutoRecordCompleteShowing = document.querySelector('#LiveTvAutoRecordCompleteShowing').checked;
+                        config.LiveTvIncompleteThresholdPercent = Math.min(100, Math.max(50, parseInt(document.querySelector('#LiveTvIncompleteThresholdPercent').value, 10) || 90));
                         config.AnimeMarkersEnabled = document.querySelector('#AnimeMarkersEnabled').checked;
                         config.AnimeMarkerRecapLookup = document.querySelector('#AnimeMarkerRecapLookup').checked;
                         config.AnimeAudioMarkersEnabled = document.querySelector('#AnimeAudioMarkersEnabled').checked;
