@@ -1,4 +1,5 @@
 using System.Net.Mime;
+using System.Text.Json.Serialization;
 using Microsoft.AspNetCore.Authorization;
 using Microsoft.AspNetCore.Http;
 using Microsoft.AspNetCore.Mvc;
@@ -113,15 +114,19 @@ public class LiveTvRecordingsController : ControllerBase
 
 public sealed class CompleteShowingBody
 {
+    [JsonPropertyName("programId")]
     public string? ProgramId { get; set; }
 }
 
 public sealed class CompleteShowingResponse
 {
     /// <summary>scheduled, recorded or notFound.</summary>
+    [JsonPropertyName("state")]
     public string? State { get; set; }
 
+    [JsonPropertyName("scheduledStart")]
     public DateTime? ScheduledStart { get; set; }
 
+    [JsonPropertyName("channelName")]
     public string? ChannelName { get; set; }
 }

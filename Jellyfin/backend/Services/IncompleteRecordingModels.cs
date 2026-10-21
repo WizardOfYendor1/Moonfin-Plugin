@@ -1,3 +1,5 @@
+using System.Text.Json.Serialization;
+
 namespace Moonfin.Server.Services;
 
 /// <summary>
@@ -311,26 +313,35 @@ public enum ScheduleResult
 /// <summary>Server-wide settings for the feature.</summary>
 public sealed class IncompleteRecordingSettings
 {
+    [JsonPropertyName("autoRecordComplete")]
     public bool AutoRecordComplete { get; set; }
 
+    [JsonPropertyName("thresholdPercent")]
     public int ThresholdPercent { get; set; } = IncompleteRecordingRules.DefaultThresholdPercent;
 }
 
 /// <summary>What a client shows for one incomplete item.</summary>
 public sealed class IncompleteRecordingStateDto
 {
+    [JsonPropertyName("itemId")]
     public string ItemId { get; set; } = string.Empty;
 
+    [JsonPropertyName("recordedMinutes")]
     public double RecordedMinutes { get; set; }
 
+    [JsonPropertyName("expectedMinutes")]
     public double ExpectedMinutes { get; set; }
 
     /// <summary>scheduled, recorded, notFound, or null when there is nothing to say.</summary>
+    [JsonPropertyName("state")]
     public string? State { get; set; }
 
+    [JsonPropertyName("scheduledStart")]
     public DateTime? ScheduledStart { get; set; }
 
+    [JsonPropertyName("channelName")]
     public string? ChannelName { get; set; }
 
+    [JsonPropertyName("recordedAt")]
     public DateTime? RecordedAt { get; set; }
 }
