@@ -4,13 +4,15 @@ using Microsoft.Extensions.Logging;
 namespace Moonfin.Server.Services;
 
 /// <summary>
-/// Flags Live TV recordings that came out incomplete and, when asked, schedules a complete showing
-/// of the same episode. It measures the minutes a recording was actually being written, so a
-/// post-processing script that moves, cuts or transcodes the file afterwards can't affect the
-/// verdict. It never deletes anything.
+/// Flags Live TV recordings that came out incomplete and, when asked, schedules a later showing of
+/// the same episode. Detection is schedule-based: it estimates how much of each file's padded
+/// schedule was being written, so it can't vouch for the content itself, and it measures while the
+/// recording runs so a post-processing script that moves, cuts or transcodes the file afterwards
+/// can't affect the verdict. It never deletes anything.
 ///
-/// All state lives in one JSON file and every read and write goes through one lock, so concurrent
-/// API calls and server events can't corrupt it or schedule the same showing twice.
+/// All state lives in one JSON file and every read and write goes through one lock. Before asking
+/// the server for a timer the chosen showing is saved, so a crash between the two is reconciled
+/// against the server's timers rather than scheduling a second one.
 /// </summary>
 public sealed class IncompleteRecordingService : IDisposable
 {
@@ -28,7 +30,16 @@ public sealed class IncompleteRecordingService : IDisposable
     // Requests opened or reopened since the last run, searched without waiting for a guide refresh.
     private readonly HashSet<string> _searchNow = new(StringComparer.Ordinal);
 
-    private readonly DateTime _watchingSince;
+    // The recorder runs in this process, so nothing it wrote predates this process's start. A
+    // fragment last sampled by another process is taken to have ended within one interval of
+    // that sample, since the sampler would otherwise have seen it again.
+    private readonly string _processId = Guid.NewGuid().ToString("N");
+    private readonly DateTime _processStart;
+
+    // When each timer in its window was last seen not recording, so a late start this process
+    // watched counts as not recorded rather than unobserved.
+    private readonly Dictionary<string, DateTime> _lastSeenIdle = new(StringComparer.Ordinal);
+
     private IncompleteRecordingStoreData? _data;
     private IReadOnlyList<ScheduledTimer> _timers = Array.Empty<ScheduledTimer>();
     private DateTime? _timersLoadedAt;
@@ -57,7 +68,7 @@ public sealed class IncompleteRecordingService : IDisposable
         _time = time;
         _storePath = storePath;
         _settings = settings;
-        _watchingSince = Now;
+        _processStart = Now;
     }
 
     private DateTime Now => _time.GetUtcNow().UtcDateTime;
@@ -144,6 +155,11 @@ public sealed class IncompleteRecordingService : IDisposable
                 await ReloadTimersAsync(cancellationToken).ConfigureAwait(false);
             }
 
+            foreach (var stale in _lastSeenIdle.Where(e => now - e.Value > TimeSpan.FromDays(1)).Select(e => e.Key).ToList())
+            {
+                _lastSeenIdle.Remove(stale);
+            }
+
             var changed = StartSnapshots(data, now);
             changed |= Sample(data, now);
             changed |= await JudgeClosedAsync(data, now, cancellationToken).ConfigureAwait(false);
@@ -174,7 +190,7 @@ public sealed class IncompleteRecordingService : IDisposable
         }
     }
 
-    /// <summary>Attaches an incomplete record to a newly added library item, by path or by episode.</summary>
+    /// <summary>Attaches a newly added library item to the incomplete recording that wrote its file.</summary>
     public async Task OnItemAddedAsync(LibraryItem item, CancellationToken cancellationToken)
     {
         await _lock.WaitAsync(cancellationToken).ConfigureAwait(false);
@@ -204,10 +220,12 @@ public sealed class IncompleteRecordingService : IDisposable
                 return;
             }
 
+            var now = Now;
             var changed = false;
             foreach (var record in data.Records.Where(r => !r.Dismissed && r.TaggedItemIds.Contains(item.Id)))
             {
                 record.Dismissed = true;
+                record.DismissedAt = now;
                 changed = true;
             }
 
@@ -223,9 +241,10 @@ public sealed class IncompleteRecordingService : IDisposable
     }
 
     /// <summary>
-    /// A removed item detaches from its record. Within a day of the recording the record waits for
-    /// a replacement (a post-processing script swapping the file); after that it is dropped. An open
-    /// request stays either way.
+    /// A removed item detaches from its record. A move by a post-processing script and a deletion
+    /// by the user look the same here, so both get the same outcome: no badge, and the record waits
+    /// out the attach window for the file to reappear renamed, then is dropped. An open request
+    /// stays either way.
     /// </summary>
     public async Task OnItemRemovedAsync(Guid itemId, CancellationToken cancellationToken)
     {
@@ -237,9 +256,13 @@ public sealed class IncompleteRecordingService : IDisposable
             var changed = false;
             foreach (var record in data.Records.Where(r => r.ItemIds.Contains(itemId)).ToList())
             {
-                record.ItemIds.Remove(itemId);
+                foreach (var fragment in record.Fragments)
+                {
+                    fragment.ItemIds.Remove(itemId);
+                }
+
                 record.TaggedItemIds.Remove(itemId);
-                if (record.ItemIds.Count == 0 && now - record.JudgedAt >= IncompleteRecordingRules.AttachWindow)
+                if (!record.ItemIds.Any() && now - record.JudgedAt >= IncompleteRecordingRules.AttachWindow)
                 {
                     data.Records.Remove(record);
                 }
@@ -259,10 +282,10 @@ public sealed class IncompleteRecordingService : IDisposable
     }
 
     /// <summary>
-    /// The display state of each incomplete item among the given ones, or of every incomplete item
-    /// when none are given. Complete items are left out.
+    /// The display state of each incomplete item among the given ones that the user can see, or of
+    /// every incomplete item the user can see when none are given. Complete items are left out.
     /// </summary>
-    public async Task<IReadOnlyList<IncompleteRecordingStateDto>> GetStatesAsync(IEnumerable<Guid>? itemIds, CancellationToken cancellationToken)
+    public async Task<IReadOnlyList<IncompleteRecordingStateDto>> GetStatesAsync(IEnumerable<Guid>? itemIds, Guid userId, CancellationToken cancellationToken)
     {
         await _lock.WaitAsync(cancellationToken).ConfigureAwait(false);
         try
@@ -275,7 +298,7 @@ public sealed class IncompleteRecordingService : IDisposable
             foreach (var itemId in ids.Distinct())
             {
                 var record = data.Records.FirstOrDefault(r => !r.Dismissed && r.ItemIds.Contains(itemId));
-                if (record == null)
+                if (record == null || !_host.IsVisibleTo(itemId, userId))
                 {
                     continue;
                 }
@@ -302,20 +325,35 @@ public sealed class IncompleteRecordingService : IDisposable
         }
     }
 
-    /// <summary>Keep as Complete: dismisses the item's record for everyone and removes the tag.</summary>
-    public async Task<bool> DismissAsync(Guid itemId, CancellationToken cancellationToken)
+    /// <summary>
+    /// Keep as Complete: dismisses the item's record for everyone and removes the tag. An automatic
+    /// request opened for it closes too, since the user is satisfied with this copy; an explicit
+    /// request someone asked for stays. A timer already scheduled is left alone.
+    /// </summary>
+    public async Task<bool> DismissAsync(Guid itemId, Guid userId, CancellationToken cancellationToken)
     {
         await _lock.WaitAsync(cancellationToken).ConfigureAwait(false);
         try
         {
             var data = Load();
             var record = data.Records.FirstOrDefault(r => r.ItemIds.Contains(itemId));
-            if (record == null)
+            if (record == null || !_host.IsVisibleTo(itemId, userId))
             {
                 return false;
             }
 
+            var now = Now;
             record.Dismissed = true;
+            record.DismissedAt = now;
+
+            var request = record.RequestId == null ? null : data.Requests.FirstOrDefault(r => r.Id == record.RequestId);
+            if (request != null && !request.Explicit && CompleteShowingState.IsOpen(request.State))
+            {
+                request.State = CompleteShowingState.Dismissed;
+                request.PendingProgramId = null;
+                request.ClosedAt = now;
+            }
+
             Save(data);
 
             foreach (var id in record.TaggedItemIds)
@@ -333,14 +371,19 @@ public sealed class IncompleteRecordingService : IDisposable
 
     /// <summary>
     /// Opens an explicit request for a program's episode, or joins the open one, and searches for a
-    /// showing at once. Returns null when the program has no season and episode numbers.
+    /// showing at once. Calling it again for the same episode returns the same request.
     /// </summary>
-    public async Task<CompleteShowingRequest?> RequestCompleteShowingAsync(string programId, CancellationToken cancellationToken)
+    public async Task<(CompleteShowingRequest? Request, CompleteShowingRefusal Refusal)> RequestCompleteShowingAsync(string programId, Guid userId, CancellationToken cancellationToken)
     {
+        if (!Guid.TryParse(programId, out var programGuid) || !_host.IsVisibleTo(programGuid, userId))
+        {
+            return (null, CompleteShowingRefusal.NotFound);
+        }
+
         var key = _host.GetProgram(programId)?.Key;
         if (key == null)
         {
-            return null;
+            return (null, CompleteShowingRefusal.NoEpisodeNumbers);
         }
 
         await _lock.WaitAsync(cancellationToken).ConfigureAwait(false);
@@ -364,7 +407,7 @@ public sealed class IncompleteRecordingService : IDisposable
 
             await SearchAsync(data, now, false, cancellationToken).ConfigureAwait(false);
             Save(data);
-            return request;
+            return (request, CompleteShowingRefusal.None);
         }
         finally
         {
@@ -390,7 +433,7 @@ public sealed class IncompleteRecordingService : IDisposable
         }
     }
 
-    // A snapshot is taken the first minute a timer in its window is actually recording.
+    // A snapshot is taken the first time a timer in its window is seen recording.
     private bool StartSnapshots(IncompleteRecordingStoreData data, DateTime now)
     {
         var changed = false;
@@ -405,6 +448,7 @@ public sealed class IncompleteRecordingService : IDisposable
             var path = _host.GetActiveRecordingPath(timer.TimerId);
             if (path == null)
             {
+                _lastSeenIdle[timer.TimerId] = now;
                 continue;
             }
 
@@ -414,14 +458,14 @@ public sealed class IncompleteRecordingService : IDisposable
                 continue;
             }
 
-            data.Snapshots.Add(CreateSnapshot(timer, details, now));
+            data.Snapshots.Add(CreateSnapshot(timer, details));
             changed = true;
         }
 
         return changed;
     }
 
-    private RecordingSnapshot CreateSnapshot(ScheduledTimer timer, ActiveRecordingTimer details, DateTime now)
+    private RecordingSnapshot CreateSnapshot(ScheduledTimer timer, ActiveRecordingTimer details)
     {
         var snapshot = new RecordingSnapshot
         {
@@ -450,56 +494,101 @@ public sealed class IncompleteRecordingService : IDisposable
             snapshot.WindowStart = start;
         }
 
-        // The plugin wasn't running when this window opened (it was just installed or updated), so
-        // what was written before can't be known. Giving it the benefit of the doubt errs toward
-        // not flagging.
-        if (snapshot.WindowStart < _watchingSince)
-        {
-            var unseen = (Min(now, _watchingSince) - snapshot.WindowStart).TotalMinutes;
-            snapshot.RecordedMinutes = Math.Clamp(unseen, 0, snapshot.ExpectedMinutes);
-        }
-
         return snapshot;
     }
 
-    // A minute counts only when the recording is active and its file grew since the last sample,
-    // so a tuner stall with the recorder still running doesn't count.
+    // Estimates each file's recording coverage. The interval since the last sample is credited
+    // only when it is the same file, in the same process, the file grew, and the gap is short
+    // enough to vouch for. A new file or a restart starts a new baseline. Time that can't be
+    // observed is counted as unknown, never as recorded.
     private bool Sample(IncompleteRecordingStoreData data, DateTime now)
     {
         var changed = false;
         var minimumGap = IncompleteRecordingRules.SampleInterval * 0.9;
         foreach (var snapshot in data.Snapshots.Where(s => s.JudgedAt == null))
         {
-            if (snapshot.LastSampleAt != null && now - snapshot.LastSampleAt < minimumGap)
+            var path = _host.GetActiveRecordingPath(snapshot.TimerId);
+            var open = snapshot.Fragments.LastOrDefault(f => !f.Ended);
+
+            if (open != null && path == open.Path && open.ProcessId == _processId && now - open.LastSampleAt < minimumGap)
             {
                 continue;
             }
 
-            var path = _host.GetActiveRecordingPath(snapshot.TimerId);
+            if (open != null && (path != open.Path || open.ProcessId != _processId))
+            {
+                CloseFragment(open, now);
+                open = null;
+                changed = true;
+            }
+
             if (path == null)
             {
+                _lastSeenIdle[snapshot.TimerId] = now;
                 continue;
-            }
-
-            snapshot.LastSampleAt = now;
-            changed = true;
-
-            var fragment = snapshot.Fragments.FirstOrDefault(f => f.Path == path);
-            if (fragment == null)
-            {
-                fragment = new RecordingFragment { Path = path };
-                snapshot.Fragments.Add(fragment);
             }
 
             var size = _host.GetFileLength(path) ?? 0;
-            if (size > fragment.LastSize)
+            if (open == null)
             {
-                snapshot.RecordedMinutes += IncompleteRecordingRules.SampleInterval.TotalMinutes;
-                fragment.LastSize = size;
+                // The file began after the window opened, after this process started, after the
+                // previous file's last sample, and after the last time the timer was seen idle.
+                var earliest = Max(snapshot.WindowStart, _processStart);
+                if (snapshot.Fragments.Count > 0)
+                {
+                    earliest = Max(earliest, snapshot.Fragments.Max(f => f.LastSampleAt));
+                }
+
+                if (_lastSeenIdle.TryGetValue(snapshot.TimerId, out var idle))
+                {
+                    earliest = Max(earliest, idle);
+                }
+
+                snapshot.Fragments.Add(new RecordingFragment
+                {
+                    Path = path,
+                    ProcessId = _processId,
+                    FirstSampleAt = now,
+                    LastSampleAt = now,
+                    LastSize = size,
+                    UnknownSeconds = Math.Max(0, (now - earliest).TotalSeconds),
+                });
             }
+            else
+            {
+                var elapsed = (now - open.LastSampleAt).TotalSeconds;
+                if (size > open.LastSize)
+                {
+                    if (elapsed <= IncompleteRecordingRules.MaxCreditedGap.TotalSeconds)
+                    {
+                        open.CoveredSeconds += elapsed;
+                    }
+                    else
+                    {
+                        open.UnknownSeconds += elapsed;
+                    }
+                }
+
+                open.LastSampleAt = now;
+                open.LastSize = size;
+            }
+
+            changed = true;
         }
 
         return changed;
+    }
+
+    // The file stopped being written somewhere after its last sample. In this process that was
+    // before now; across a restart it is taken to be within an interval of the last sample.
+    private void CloseFragment(RecordingFragment fragment, DateTime now)
+    {
+        var bound = fragment.ProcessId == _processId
+            ? IncompleteRecordingRules.MaxCreditedGap
+            : IncompleteRecordingRules.SampleInterval;
+        var tail = Math.Clamp((now - fragment.LastSampleAt).TotalSeconds, 0, bound.TotalSeconds);
+        fragment.UnknownSeconds += tail;
+        fragment.Ended = true;
     }
 
     private async Task<bool> JudgeClosedAsync(IncompleteRecordingStoreData data, DateTime now, CancellationToken cancellationToken)
@@ -519,24 +608,35 @@ public sealed class IncompleteRecordingService : IDisposable
                 continue;
             }
 
+            foreach (var fragment in snapshot.Fragments.Where(f => !f.Ended))
+            {
+                CloseFragment(fragment, now);
+            }
+
+            _lastSeenIdle.Remove(snapshot.TimerId);
             snapshot.JudgedAt = now;
-            snapshot.Complete = !IncompleteRecordingRules.IsIncomplete(snapshot.RecordedMinutes, snapshot.ExpectedMinutes, threshold);
+            snapshot.Verdict = IncompleteRecordingRules.Classify(snapshot.Fragments, snapshot.ExpectedMinutes, threshold);
             changed = true;
 
             _logger.LogInformation(
-                "Live TV recording {TimerId} wrote {Recorded:0.#} of {Expected:0.#} minutes, {Verdict}",
+                "Live TV recording {TimerId}: best file covered an estimated {Covered:0.#} of {Expected:0.#} scheduled minutes in {Files} file(s), {Verdict}",
                 snapshot.TimerId,
-                snapshot.RecordedMinutes,
+                snapshot.BestCoveredMinutes,
                 snapshot.ExpectedMinutes,
-                snapshot.Complete == true ? "complete" : "incomplete");
+                snapshot.Fragments.Count,
+                snapshot.Verdict);
 
-            if (snapshot.Complete == true)
+            switch (snapshot.Verdict)
             {
-                OnCompleteRecording(data, snapshot, now);
-            }
-            else
-            {
-                await OnIncompleteRecordingAsync(data, snapshot, now, cancellationToken).ConfigureAwait(false);
+                case RecordingVerdict.Complete:
+                    OnCompleteRecording(data, snapshot, now);
+                    break;
+                case RecordingVerdict.Incomplete:
+                    await OnIncompleteRecordingAsync(data, snapshot, now, cancellationToken).ConfigureAwait(false);
+                    break;
+                default:
+                    OnUnknownRecording(data, snapshot, now);
+                    break;
             }
         }
 
@@ -554,7 +654,21 @@ public sealed class IncompleteRecordingService : IDisposable
         if (request != null)
         {
             request.State = CompleteShowingState.Done;
+            request.PendingProgramId = null;
             request.RecordedAt = now;
+            request.ClosedAt = now;
+        }
+    }
+
+    // Too little was observed to judge. If this was the scheduled showing, the request ends
+    // without a verdict rather than retrying on a guess.
+    private static void OnUnknownRecording(IncompleteRecordingStoreData data, RecordingSnapshot snapshot, DateTime now)
+    {
+        var request = data.Requests.FirstOrDefault(r => r.State == CompleteShowingState.Scheduled
+            && string.Equals(r.ScheduledProgramId, snapshot.ProgramId, StringComparison.OrdinalIgnoreCase));
+        if (request != null)
+        {
+            request.State = CompleteShowingState.Unverified;
             request.ClosedAt = now;
         }
     }
@@ -564,10 +678,20 @@ public sealed class IncompleteRecordingService : IDisposable
         var record = new IncompleteRecord
         {
             TimerId = snapshot.TimerId,
-            RecordedMinutes = snapshot.RecordedMinutes,
+            RecordedMinutes = snapshot.BestCoveredMinutes,
             ExpectedMinutes = snapshot.ExpectedMinutes,
             Episode = snapshot.Episode,
-            FragmentPaths = snapshot.Fragments.Select(f => f.Path).ToList(),
+            Fragments = snapshot.Fragments
+                .Select(f => new RecordingFragment
+                {
+                    Path = f.Path,
+                    FirstSampleAt = f.FirstSampleAt,
+                    LastSampleAt = f.LastSampleAt,
+                    CoveredSeconds = f.CoveredSeconds,
+                    UnknownSeconds = f.UnknownSeconds,
+                    Ended = true,
+                })
+                .ToList(),
             JudgedAt = now,
         };
         data.Records.Add(record);
@@ -577,25 +701,15 @@ public sealed class IncompleteRecordingService : IDisposable
             record.RequestId = LinkRequest(data, snapshot, now)?.Id;
         }
 
-        // The library may already hold the item: the server queues its scan when the recording stops.
-        foreach (var path in record.FragmentPaths)
+        // The server queues a library refresh when a recording starts and again when it stops,
+        // so the items may already be there. Reconcile with them now; later arrivals come
+        // through ItemAdded.
+        foreach (var fragment in record.Fragments)
         {
-            if (_host.FindItemByPath(path) is { } item)
+            var item = _host.FindItemByPath(fragment.Path) ?? FindRenamedItem(data, fragment);
+            if (item != null)
             {
-                await AttachAsync(record, item, cancellationToken).ConfigureAwait(false);
-            }
-        }
-
-        if (record.ItemIds.Count == 0 && record.Episode != null)
-        {
-            var completePaths = CompleteFragmentPaths(data);
-            var candidate = _host.FindEpisodes(record.Episode)
-                .Where(i => i.DateCreated >= snapshot.WindowStart && IsFreeForEpisodeAttach(data, i, completePaths))
-                .OrderBy(i => i.DateCreated)
-                .FirstOrDefault();
-            if (candidate != null)
-            {
-                await AttachAsync(record, candidate, cancellationToken).ConfigureAwait(false);
+                await AttachAsync(record, fragment, item, cancellationToken).ConfigureAwait(false);
             }
         }
     }
@@ -603,23 +717,24 @@ public sealed class IncompleteRecordingService : IDisposable
     private CompleteShowingRequest? LinkRequest(IncompleteRecordingStoreData data, RecordingSnapshot snapshot, DateTime now)
     {
         var episode = snapshot.Episode!;
+        var scheduled = data.Requests.FirstOrDefault(r => r.State == CompleteShowingState.Scheduled
+            && string.Equals(r.ScheduledProgramId, snapshot.ProgramId, StringComparison.OrdinalIgnoreCase));
+        if (scheduled != null)
+        {
+            RecordFailedAttempt(scheduled, now);
+            return scheduled;
+        }
+
         var open = FindOpenRequest(data, episode);
         if (open != null)
         {
-            var wasScheduledShowing = open.State == CompleteShowingState.Scheduled
-                && string.Equals(open.ScheduledProgramId, snapshot.ProgramId, StringComparison.OrdinalIgnoreCase);
-            if (wasScheduledShowing)
-            {
-                RecordFailedAttempt(open, now);
-            }
-
             return open;
         }
 
         // A request that gave up or that the user cancelled isn't reopened by a later recording.
         var ended = data.Requests
             .Where(r => r.State is CompleteShowingState.GaveUp or CompleteShowingState.CancelledByUser)
-            .LastOrDefault(r => r.Episode.MatchesAiring(episode));
+            .LastOrDefault(r => r.Episode.Matches(episode));
         if (ended != null)
         {
             return ended;
@@ -660,9 +775,23 @@ public sealed class IncompleteRecordingService : IDisposable
         request.ScheduledChannelName = null;
     }
 
-    // Follows each scheduled showing's timer: cancelled means the user cancelled it, gone before it
-    // aired means a guide change removed it, and still nothing long after it ended means it never
-    // recorded.
+    private static void SetScheduled(CompleteShowingRequest request, GuideProgram showing)
+    {
+        request.State = CompleteShowingState.Scheduled;
+        request.PendingProgramId = null;
+        request.ScheduledProgramId = showing.Id;
+        request.ScheduledStart = showing.StartDate;
+        request.ScheduledEnd = showing.EndDate;
+        request.ScheduledChannelName = showing.ChannelName;
+    }
+
+    private ScheduledTimer? LiveTimerFor(string programId) =>
+        _timers.FirstOrDefault(t => IsLive(t) && string.Equals(t.ProgramId, programId, StringComparison.OrdinalIgnoreCase));
+
+    // Follows each scheduled showing's timer. Cancelled is final, except when the series rule
+    // visibly moved the recording to another airing of the episode, which the request then
+    // follows. Gone before it aired means a guide change removed it, so the request searches
+    // again. Still nothing long after it ended means it never recorded, which uses an attempt.
     private bool TrackScheduledRequests(IncompleteRecordingStoreData data, DateTime now)
     {
         if (_timersLoadedAt == null)
@@ -671,15 +800,27 @@ public sealed class IncompleteRecordingService : IDisposable
         }
 
         var changed = false;
-        foreach (var request in data.Requests.Where(r => r.State == CompleteShowingState.Scheduled))
+        foreach (var request in data.Requests.Where(r => r.State == CompleteShowingState.Scheduled).ToList())
         {
             var timer = _timers.FirstOrDefault(t =>
                 string.Equals(t.ProgramId, request.ScheduledProgramId, StringComparison.OrdinalIgnoreCase));
 
             if (timer?.Status == "Cancelled")
             {
-                request.State = CompleteShowingState.CancelledByUser;
-                request.ClosedAt = now;
+                var moved = FindAiringsSafe(request.Episode, now)
+                    .Where(p => p.Key is { } key && request.Episode.Matches(key) && LiveTimerFor(p.Id) != null)
+                    .OrderBy(p => p.StartDate)
+                    .FirstOrDefault();
+                if (moved != null)
+                {
+                    SetScheduled(request, moved);
+                }
+                else
+                {
+                    request.State = CompleteShowingState.CancelledByUser;
+                    request.ClosedAt = now;
+                }
+
                 changed = true;
             }
             else if (timer == null && request.ScheduledStart > now)
@@ -701,7 +842,8 @@ public sealed class IncompleteRecordingService : IDisposable
         return changed;
     }
 
-    // Turning the automatic setting off drops the automatic requests still waiting; explicit ones stay.
+    // Turning the automatic setting off drops the automatic requests still waiting; explicit ones,
+    // including any an explicit request folded into, stay.
     private bool ApplySettings(IncompleteRecordingStoreData data)
     {
         if (_settings().AutoRecordComplete)
@@ -710,7 +852,7 @@ public sealed class IncompleteRecordingService : IDisposable
         }
 
         var dropped = data.Requests
-            .Where(r => r.State == CompleteShowingState.Waiting && !r.Explicit)
+            .Where(r => r.State == CompleteShowingState.Waiting && !r.Explicit && r.PendingProgramId == null)
             .Select(r => r.Id)
             .ToHashSet();
         if (dropped.Count == 0)
@@ -727,19 +869,50 @@ public sealed class IncompleteRecordingService : IDisposable
         return true;
     }
 
+    private IReadOnlyList<GuideProgram> FindAiringsSafe(EpisodeKey episode, DateTime now)
+    {
+        try
+        {
+            return _host.FindAirings(episode, now);
+        }
+        catch (Exception ex) when (ex is not OperationCanceledException)
+        {
+            _logger.LogWarning(ex, "Could not search the guide for {Series} S{Season}E{Episode}", episode.SeriesName, episode.Season, episode.Episode);
+            return Array.Empty<GuideProgram>();
+        }
+    }
+
     private async Task<bool> SearchAsync(IncompleteRecordingStoreData data, DateTime now, bool searchAll, CancellationToken cancellationToken)
     {
         var changed = false;
-        var scheduledAny = false;
+        var askedServer = false;
         foreach (var request in data.Requests.Where(r => r.State == CompleteShowingState.Waiting).ToList())
         {
-            if (!searchAll && !_searchNow.Contains(request.Id))
+            if (!searchAll && !_searchNow.Contains(request.Id) && request.PendingProgramId == null)
             {
                 continue;
             }
 
             _searchNow.Remove(request.Id);
-            if (now - request.OpenedAt >= IncompleteRecordingRules.RequestLifetime)
+
+            // A showing chosen before a crash or a failed call: if the server made its timer,
+            // adopt it; otherwise ask again for the same showing while it is still ahead.
+            GuideProgram? showing = null;
+            if (request.PendingProgramId != null)
+            {
+                var pending = _host.GetProgram(request.PendingProgramId);
+                if (pending != null && (LiveTimerFor(pending.Id) != null || pending.StartDate > now))
+                {
+                    showing = pending;
+                }
+                else
+                {
+                    request.PendingProgramId = null;
+                    changed = true;
+                }
+            }
+
+            if (showing == null && now - request.OpenedAt >= IncompleteRecordingRules.RequestLifetime)
             {
                 request.State = CompleteShowingState.NotFound;
                 request.ClosedAt = now;
@@ -747,45 +920,33 @@ public sealed class IncompleteRecordingService : IDisposable
                 continue;
             }
 
-            GuideProgram? showing;
-            try
-            {
-                showing = IncompleteRecordingRules.ChooseShowing(request.Episode, _host.FindAirings(request.Episode, now), now);
-            }
-            catch (Exception ex) when (ex is not OperationCanceledException)
-            {
-                _logger.LogWarning(ex, "Could not search the guide for {Series} S{Season}E{Episode}", request.Episode.SeriesName, request.Episode.Season, request.Episode.Episode);
-                continue;
-            }
-
+            showing ??= IncompleteRecordingRules.ChooseShowing(request.Episode, FindAiringsSafe(request.Episode, now), now);
             if (showing == null)
             {
                 continue;
             }
 
-            // A showing someone already scheduled is followed as it is; no second timer is made.
-            var existing = _timers.Any(t => IsLive(t)
-                && string.Equals(t.ProgramId, showing.Id, StringComparison.OrdinalIgnoreCase));
-            if (!existing)
+            // A showing that already has a timer, whoever made it, is adopted and followed like
+            // one the plugin scheduled, and uses an attempt the same way.
+            if (LiveTimerFor(showing.Id) == null)
             {
+                request.PendingProgramId = showing.Id;
+                Save(data);
+
                 var result = await _host.ScheduleProgramAsync(showing.Id, cancellationToken).ConfigureAwait(false);
+                askedServer = true;
                 if (result == ScheduleResult.Failed)
                 {
+                    changed = true;
                     continue;
                 }
-
-                scheduledAny = true;
             }
 
-            request.State = CompleteShowingState.Scheduled;
-            request.ScheduledProgramId = showing.Id;
-            request.ScheduledStart = showing.StartDate;
-            request.ScheduledEnd = showing.EndDate;
-            request.ScheduledChannelName = showing.ChannelName;
+            SetScheduled(request, showing);
             changed = true;
 
             _logger.LogInformation(
-                "Scheduled a complete showing of {Series} S{Season}E{Episode} at {Start} on {Channel}",
+                "Following a later showing of {Series} S{Season}E{Episode} at {Start} on {Channel}",
                 request.Episode.SeriesName,
                 request.Episode.Season,
                 request.Episode.Episode,
@@ -795,7 +956,7 @@ public sealed class IncompleteRecordingService : IDisposable
 
         // Flipping a cancelled showing back to New raises no timer event, and a showing the server
         // says is already scheduled may be missing from the cache, so reload here.
-        if (scheduledAny)
+        if (askedServer)
         {
             await ReloadTimersAsync(cancellationToken).ConfigureAwait(false);
         }
@@ -809,8 +970,10 @@ public sealed class IncompleteRecordingService : IDisposable
             s.JudgedAt != null && now - s.JudgedAt >= IncompleteRecordingRules.SnapshotRetention);
 
         removed += data.Records.RemoveAll(r =>
-            r.ItemIds.Count == 0
-            && now - r.JudgedAt >= IncompleteRecordingRules.AttachWindow + IncompleteRecordingRules.SnapshotRetention);
+            (!r.ItemIds.Any() && now - r.JudgedAt >= IncompleteRecordingRules.AttachWindow)
+            || (r.Dismissed && now - (r.DismissedAt ?? r.JudgedAt) >= IncompleteRecordingRules.DismissedRecordRetention
+                && now - r.JudgedAt >= IncompleteRecordingRules.AttachWindow)
+            || now - r.JudgedAt >= IncompleteRecordingRules.RecordRetention);
 
         var referenced = data.Records.Where(r => r.RequestId != null).Select(r => r.RequestId!).ToHashSet();
         removed += data.Requests.RemoveAll(r =>
@@ -822,66 +985,70 @@ public sealed class IncompleteRecordingService : IDisposable
         return removed > 0;
     }
 
+    // Provenance only: the item's path is one the recording wrote, or the same file renamed in
+    // place after the original went away. A copy elsewhere with the same episode numbers could be
+    // a separate, complete recording, so it is never attached.
     private async Task<bool> TryAttachAsync(IncompleteRecordingStoreData data, LibraryItem item, DateTime now, CancellationToken cancellationToken)
     {
-        if (string.IsNullOrEmpty(item.Path))
+        if (string.IsNullOrEmpty(item.Path) || data.Records.Any(r => r.ItemIds.Contains(item.Id)))
         {
             return false;
         }
 
-        var byPath = data.Records.FirstOrDefault(r =>
-            !r.Dismissed && !r.ItemIds.Contains(item.Id) && r.FragmentPaths.Contains(item.Path, PathComparer));
-        if (byPath != null)
+        foreach (var record in data.Records.Where(r => !r.Dismissed))
         {
-            await AttachAsync(byPath, item, cancellationToken).ConfigureAwait(false);
-            return true;
+            foreach (var fragment in record.Fragments)
+            {
+                if (string.Equals(fragment.Path, item.Path, StringComparison.OrdinalIgnoreCase)
+                    || (now - record.JudgedAt < IncompleteRecordingRules.AttachWindow && IsRenamedCopy(fragment, item)))
+                {
+                    await AttachAsync(record, fragment, item, cancellationToken).ConfigureAwait(false);
+                    return true;
+                }
+            }
         }
 
-        var completePaths = CompleteFragmentPaths(data);
-        if (!IsFreeForEpisodeAttach(data, item, completePaths))
-        {
-            return false;
-        }
-
-        var byEpisode = data.Records
-            .Where(r => !r.Dismissed
-                && r.ItemIds.Count == 0
-                && r.Episode != null
-                && now - r.JudgedAt < IncompleteRecordingRules.AttachWindow
-                && r.Episode.MatchesLibraryEpisode(item.SeriesName, item.Season, item.Episode, item.EpisodeTitle))
-            .OrderBy(r => r.JudgedAt)
-            .FirstOrDefault();
-        if (byEpisode == null)
-        {
-            return false;
-        }
-
-        await AttachAsync(byEpisode, item, cancellationToken).ConfigureAwait(false);
-        return true;
+        return false;
     }
 
-    private static StringComparer PathComparer => StringComparer.OrdinalIgnoreCase;
-
-    // Files of recordings judged complete, which must never be badged by an episode match.
-    private static HashSet<string> CompleteFragmentPaths(IncompleteRecordingStoreData data) =>
-        data.Snapshots
-            .Where(s => s.Complete == true)
-            .SelectMany(s => s.Fragments.Select(f => f.Path))
-            .ToHashSet(PathComparer);
-
-    private static bool IsFreeForEpisodeAttach(IncompleteRecordingStoreData data, LibraryItem item, HashSet<string> completePaths) =>
-        !string.IsNullOrEmpty(item.Path)
-        && !completePaths.Contains(item.Path)
-        && !data.Records.Any(r => r.ItemIds.Contains(item.Id));
-
-    private async Task AttachAsync(IncompleteRecord record, LibraryItem item, CancellationToken cancellationToken)
+    // The same file renamed in place: the original is gone, and it is the only file beside where
+    // it was with the same name, created after the recording began.
+    private bool IsRenamedCopy(RecordingFragment fragment, LibraryItem item)
     {
-        if (record.ItemIds.Contains(item.Id))
+        if (fragment.ItemIds.Count > 0 || item.DateCreated < fragment.FirstSampleAt || _host.FileExists(fragment.Path))
+        {
+            return false;
+        }
+
+        var siblings = _host.FindRenamedSiblings(fragment.Path);
+        return siblings.Count == 1 && string.Equals(siblings[0], item.Path, StringComparison.OrdinalIgnoreCase);
+    }
+
+    private LibraryItem? FindRenamedItem(IncompleteRecordingStoreData data, RecordingFragment fragment)
+    {
+        if (fragment.ItemIds.Count > 0 || _host.FileExists(fragment.Path))
+        {
+            return null;
+        }
+
+        var siblings = _host.FindRenamedSiblings(fragment.Path);
+        var item = siblings.Count == 1 ? _host.FindItemByPath(siblings[0]) : null;
+        if (item == null || item.DateCreated < fragment.FirstSampleAt || data.Records.Any(r => r.ItemIds.Contains(item.Id)))
+        {
+            return null;
+        }
+
+        return item;
+    }
+
+    private async Task AttachAsync(IncompleteRecord record, RecordingFragment fragment, LibraryItem item, CancellationToken cancellationToken)
+    {
+        if (fragment.ItemIds.Contains(item.Id))
         {
             return;
         }
 
-        record.ItemIds.Add(item.Id);
+        fragment.ItemIds.Add(item.Id);
         if (record.Dismissed || record.TaggedItemIds.Contains(item.Id))
         {
             return;
@@ -908,9 +1075,9 @@ public sealed class IncompleteRecordingService : IDisposable
     }
 
     private static CompleteShowingRequest? FindOpenRequest(IncompleteRecordingStoreData data, EpisodeKey episode) =>
-        data.Requests.FirstOrDefault(r => CompleteShowingState.IsOpen(r.State) && r.Episode.MatchesAiring(episode));
+        data.Requests.FirstOrDefault(r => CompleteShowingState.IsOpen(r.State) && r.Episode.Matches(episode));
 
-    private static DateTime Min(DateTime a, DateTime b) => a < b ? a : b;
+    private static DateTime Max(DateTime a, DateTime b) => a > b ? a : b;
 
     private IncompleteRecordingStoreData Load()
     {
@@ -936,4 +1103,11 @@ public sealed class IncompleteRecordingService : IDisposable
             _logger.LogWarning(ex, "Could not save incomplete recordings to {Path}", _storePath);
         }
     }
+}
+
+public enum CompleteShowingRefusal
+{
+    None,
+    NotFound,
+    NoEpisodeNumbers,
 }

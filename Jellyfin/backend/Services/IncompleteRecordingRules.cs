@@ -16,6 +16,12 @@ public static class IncompleteRecordingRules
 
     public static readonly TimeSpan SampleInterval = TimeSpan.FromMinutes(1);
 
+    /// <summary>
+    /// The longest gap between two samples that is still credited when the file grew across it.
+    /// A longer gap is unobserved time: growth across it shows something was written, not when.
+    /// </summary>
+    public static readonly TimeSpan MaxCreditedGap = TimeSpan.FromMinutes(2);
+
     public static readonly TimeSpan SafetyNetInterval = TimeSpan.FromMinutes(15);
 
     public static readonly TimeSpan RequestSearchFallback = TimeSpan.FromDays(1);
@@ -27,6 +33,12 @@ public static class IncompleteRecordingRules
     public static readonly TimeSpan SnapshotRetention = TimeSpan.FromDays(7);
 
     public static readonly TimeSpan ClosedRequestRetention = TimeSpan.FromDays(30);
+
+    /// <summary>A dismissed record is kept this long after judging, past the attach window, then dropped.</summary>
+    public static readonly TimeSpan DismissedRecordRetention = TimeSpan.FromDays(7);
+
+    /// <summary>An attached record whose item is still in the library is dropped after this.</summary>
+    public static readonly TimeSpan RecordRetention = TimeSpan.FromDays(365);
 
     /// <summary>
     /// A recording still being written this long after its window closed (someone extended it) is
@@ -49,6 +61,28 @@ public static class IncompleteRecordingRules
     }
 
     /// <summary>
+    /// Judges a recording by its best single file, since only one playable file is a complete
+    /// copy; files are never added together. Complete when one file's estimated coverage reaches
+    /// the threshold. Incomplete when no file could reach it even if all of its unobserved time
+    /// had been recorded. Anything between is unknown and isn't flagged.
+    /// </summary>
+    public static string Classify(IEnumerable<RecordingFragment> fragments, double expectedMinutes, int thresholdPercent)
+    {
+        var list = fragments.ToList();
+        var bestCovered = list.Count == 0 ? 0 : list.Max(f => f.CoveredSeconds) / 60;
+        var bestPossible = list.Count == 0 ? 0 : list.Max(f => f.CoveredSeconds + f.UnknownSeconds) / 60;
+
+        if (!IsIncomplete(bestCovered, expectedMinutes, thresholdPercent))
+        {
+            return RecordingVerdict.Complete;
+        }
+
+        return IsIncomplete(bestPossible, expectedMinutes, thresholdPercent)
+            ? RecordingVerdict.Incomplete
+            : RecordingVerdict.Unknown;
+    }
+
+    /// <summary>
     /// The earliest airing of the episode that starts after now, on any channel, preferring HD when
     /// two start together. This is how the server itself picks among duplicate showings.
     /// </summary>
@@ -56,7 +90,7 @@ public static class IncompleteRecordingRules
     {
         return programs
             .Where(p => p.StartDate > now)
-            .Where(p => p.Key is { } key && episode.MatchesAiring(key))
+            .Where(p => p.Key is { } key && episode.Matches(key))
             .OrderBy(p => p.StartDate)
             .ThenByDescending(p => p.IsHD)
             .FirstOrDefault();

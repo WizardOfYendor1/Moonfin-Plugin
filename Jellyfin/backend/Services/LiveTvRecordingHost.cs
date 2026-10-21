@@ -1,12 +1,12 @@
 using System.Text.Json;
 using Jellyfin.Data.Enums;
 using MediaBrowser.Controller.Entities;
-using MediaBrowser.Controller.Entities.TV;
 using MediaBrowser.Controller.Library;
 using MediaBrowser.Controller.LiveTv;
 using MediaBrowser.Model.LiveTv;
 using MediaBrowser.Model.Tasks;
 using Microsoft.Extensions.Logging;
+using Moonfin.Server.Helpers;
 
 namespace Moonfin.Server.Services;
 
@@ -49,10 +49,16 @@ public interface ILiveTvRecordingHost
 
     LibraryItem? FindItemByPath(string path);
 
-    LibraryItem? GetItem(Guid itemId);
+    bool FileExists(string path);
 
-    /// <summary>Library episodes of a series with this season and episode number.</summary>
-    IReadOnlyList<LibraryItem> FindEpisodes(EpisodeKey episode);
+    /// <summary>
+    /// Files beside a recording with the same name and another extension: what a post-processing
+    /// script leaves when it remuxes or transcodes in place.
+    /// </summary>
+    IReadOnlyList<string> FindRenamedSiblings(string path);
+
+    /// <summary>Whether a user may see a library item or guide program, parental limits and channel access included.</summary>
+    bool IsVisibleTo(Guid itemId, Guid userId);
 
     Task SetTagAsync(Guid itemId, string tag, bool present, CancellationToken cancellationToken);
 }
@@ -66,6 +72,7 @@ public sealed class JellyfinLiveTvRecordingHost : ILiveTvRecordingHost, IDisposa
     private readonly IRecordingsManager _recordingsManager;
     private readonly ILibraryManager _libraryManager;
     private readonly ITaskManager _taskManager;
+    private readonly IServiceProvider _services;
     private readonly ILogger<JellyfinLiveTvRecordingHost> _logger;
 
     public JellyfinLiveTvRecordingHost(
@@ -73,8 +80,10 @@ public sealed class JellyfinLiveTvRecordingHost : ILiveTvRecordingHost, IDisposa
         IRecordingsManager recordingsManager,
         ILibraryManager libraryManager,
         ITaskManager taskManager,
+        IServiceProvider services,
         ILogger<JellyfinLiveTvRecordingHost> logger)
     {
+        _services = services;
         _liveTvManager = liveTvManager;
         _recordingsManager = recordingsManager;
         _libraryManager = libraryManager;
@@ -241,24 +250,45 @@ public sealed class JellyfinLiveTvRecordingHost : ILiveTvRecordingHost, IDisposa
         return item == null ? null : ToLibraryItem(item);
     }
 
-    public LibraryItem? GetItem(Guid itemId)
+    public bool FileExists(string path)
     {
-        var item = _libraryManager.GetItemById(itemId);
-        return item == null ? null : ToLibraryItem(item);
+        try
+        {
+            return File.Exists(path);
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+        {
+            return false;
+        }
     }
 
-    public IReadOnlyList<LibraryItem> FindEpisodes(EpisodeKey episode)
+    public IReadOnlyList<string> FindRenamedSiblings(string path)
     {
-        return _libraryManager.GetItemList(new InternalItemsQuery
+        try
+        {
+            var directory = Path.GetDirectoryName(path);
+            if (string.IsNullOrEmpty(directory) || !Directory.Exists(directory))
             {
-                IncludeItemTypes = [BaseItemKind.Episode],
-                ParentIndexNumber = episode.Season,
-                IndexNumber = episode.Episode,
-                IsVirtualItem = false,
-            })
-            .Select(ToLibraryItem)
-            .Where(i => episode.MatchesLibraryEpisode(i.SeriesName, i.Season, i.Episode, i.EpisodeTitle))
-            .ToList();
+                return Array.Empty<string>();
+            }
+
+            var stem = Path.GetFileNameWithoutExtension(path);
+            return Directory.EnumerateFiles(directory)
+                .Where(f => string.Equals(Path.GetFileNameWithoutExtension(f), stem, StringComparison.OrdinalIgnoreCase)
+                    && !string.Equals(f, path, StringComparison.OrdinalIgnoreCase))
+                .ToList();
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+        {
+            return Array.Empty<string>();
+        }
+    }
+
+    public bool IsVisibleTo(Guid itemId, Guid userId)
+    {
+        var item = _libraryManager.GetItemById(itemId);
+        var user = UserReflection.ResolveUser(_services, userId);
+        return item != null && user != null && UserReflection.IsVisibleTo(item, user);
     }
 
     public async Task SetTagAsync(Guid itemId, string tag, bool present, CancellationToken cancellationToken)
@@ -307,15 +337,10 @@ public sealed class JellyfinLiveTvRecordingHost : ILiveTvRecordingHost, IDisposa
 
     private static LibraryItem ToLibraryItem(BaseItem item)
     {
-        var episode = item as Episode;
         return new LibraryItem
         {
             Id = item.Id,
             Path = item.Path,
-            SeriesName = episode?.SeriesName,
-            Season = episode?.ParentIndexNumber,
-            Episode = episode?.IndexNumber,
-            EpisodeTitle = episode?.Name,
             DateCreated = item.DateCreated,
             Tags = item.Tags ?? Array.Empty<string>(),
         };

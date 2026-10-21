@@ -45,7 +45,13 @@ public class LiveTvRecordingsController : ControllerBase
             .Take(500)
             .ToList();
 
-        return Ok(await _service.GetStatesAsync(ids.Count > 0 ? ids : null, cancellationToken).ConfigureAwait(false));
+        var userId = this.GetUserIdFromClaims();
+        if (userId == null)
+        {
+            return Unauthorized();
+        }
+
+        return Ok(await _service.GetStatesAsync(ids.Count > 0 ? ids : null, userId.Value, cancellationToken).ConfigureAwait(false));
     }
 
     /// <summary>Keep as Complete: dismisses the item's incomplete record for everyone and removes its tag.</summary>
@@ -55,16 +61,26 @@ public class LiveTvRecordingsController : ControllerBase
     [ProducesResponseType(StatusCodes.Status404NotFound)]
     public async Task<ActionResult> Dismiss([FromRoute] Guid itemId, CancellationToken cancellationToken)
     {
-        return await _service.DismissAsync(itemId, cancellationToken).ConfigureAwait(false)
+        var userId = this.GetUserIdFromClaims();
+        if (userId == null)
+        {
+            return Unauthorized();
+        }
+
+        return await _service.DismissAsync(itemId, userId.Value, cancellationToken).ConfigureAwait(false)
             ? NoContent()
             : NotFound();
     }
 
-    /// <summary>Asks for a complete showing of a program's episode to be recorded later.</summary>
+    /// <summary>
+    /// Asks for a later showing of a program's episode to be recorded. Repeating the call for the
+    /// same episode joins the same request, so a client can safely retry it.
+    /// </summary>
     [HttpPost("CompleteShowing")]
     [Authorize(Policy = LiveTvManagement)]
     [ProducesResponseType(StatusCodes.Status200OK)]
     [ProducesResponseType(StatusCodes.Status400BadRequest)]
+    [ProducesResponseType(StatusCodes.Status404NotFound)]
     public async Task<ActionResult<CompleteShowingResponse>> RequestCompleteShowing(
         [FromBody] CompleteShowingBody body,
         CancellationToken cancellationToken)
@@ -74,10 +90,18 @@ public class LiveTvRecordingsController : ControllerBase
             return BadRequest("programId is required.");
         }
 
-        var request = await _service.RequestCompleteShowingAsync(body.ProgramId, cancellationToken).ConfigureAwait(false);
+        var userId = this.GetUserIdFromClaims();
+        if (userId == null)
+        {
+            return Unauthorized();
+        }
+
+        var (request, refusal) = await _service.RequestCompleteShowingAsync(body.ProgramId, userId.Value, cancellationToken).ConfigureAwait(false);
         if (request == null)
         {
-            return BadRequest("The program has no season and episode numbers.");
+            return refusal == CompleteShowingRefusal.NoEpisodeNumbers
+                ? BadRequest("The program has no season and episode numbers.")
+                : NotFound();
         }
 
         return Ok(new CompleteShowingResponse
