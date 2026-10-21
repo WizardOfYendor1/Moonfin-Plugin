@@ -32,15 +32,21 @@ internal sealed class FakeRecordingHost : ILiveTvRecordingHost
 
     public Dictionary<string, ActiveRecordingTimer> ActiveTimers { get; } = new();
 
-    public Dictionary<string, long> FileSizes { get; } = new();
+    /// <summary>Files on disk and their sizes.</summary>
+    public Dictionary<string, long> Files { get; } = new();
 
     public List<GuideProgram> Programs { get; } = new();
 
     public List<LibraryItem> Items { get; } = new();
 
+    public HashSet<Guid> Hidden { get; } = new();
+
     public List<string> Scheduled { get; } = new();
 
     public int GetTimersCalls { get; private set; }
+
+    /// <summary>Makes the next schedule call create the timer and then fail, as a crash mid-call would.</summary>
+    public bool CrashAfterNextSchedule { get; set; }
 
     public Task<IReadOnlyList<ScheduledTimer>> GetTimersAsync(CancellationToken cancellationToken)
     {
@@ -52,7 +58,7 @@ internal sealed class FakeRecordingHost : ILiveTvRecordingHost
 
     public ActiveRecordingTimer? GetActiveRecordingTimer(string path) => ActiveTimers.GetValueOrDefault(path);
 
-    public long? GetFileLength(string path) => FileSizes.TryGetValue(path, out var size) ? size : null;
+    public long? GetFileLength(string path) => Files.TryGetValue(path, out var size) ? size : null;
 
     public GuideProgram? GetProgram(string programId) => Programs.FirstOrDefault(p => p.Id == programId);
 
@@ -82,8 +88,16 @@ internal sealed class FakeRecordingHost : ILiveTvRecordingHost
                 ChannelName = program.ChannelName,
                 StartDate = program.StartDate,
                 EndDate = program.EndDate,
+                PrePaddingSeconds = 120,
+                PostPaddingSeconds = 300,
                 Status = "New",
             });
+        }
+
+        if (CrashAfterNextSchedule)
+        {
+            CrashAfterNextSchedule = false;
+            throw new InvalidOperationException("Server went away after creating the timer");
         }
 
         return Task.FromResult(ScheduleResult.Created);
@@ -91,10 +105,18 @@ internal sealed class FakeRecordingHost : ILiveTvRecordingHost
 
     public LibraryItem? FindItemByPath(string path) => Items.FirstOrDefault(i => i.Path == path);
 
-    public LibraryItem? GetItem(Guid itemId) => Items.FirstOrDefault(i => i.Id == itemId);
+    public bool FileExists(string path) => Files.ContainsKey(path);
 
-    public IReadOnlyList<LibraryItem> FindEpisodes(EpisodeKey episode) =>
-        Items.Where(i => episode.MatchesLibraryEpisode(i.SeriesName, i.Season, i.Episode, i.EpisodeTitle)).ToList();
+    public IReadOnlyList<string> FindRenamedSiblings(string path)
+    {
+        var directory = Path.GetDirectoryName(path);
+        var stem = Path.GetFileNameWithoutExtension(path);
+        return Files.Keys
+            .Where(f => f != path && Path.GetDirectoryName(f) == directory && Path.GetFileNameWithoutExtension(f) == stem)
+            .ToList();
+    }
+
+    public bool IsVisibleTo(Guid itemId, Guid userId) => !Hidden.Contains(itemId);
 
     public Task SetTagAsync(Guid itemId, string tag, bool present, CancellationToken cancellationToken)
     {
@@ -109,7 +131,7 @@ internal sealed class FakeRecordingHost : ILiveTvRecordingHost
         return Task.CompletedTask;
     }
 
-    public void StartRecording(ScheduledTimer timer, string path, int retryCount = 0, int? seriesSeason = 3, int? seriesEpisode = 7, string? episodeTitle = "Pilot")
+    public void StartRecording(ScheduledTimer timer, string path, int retryCount = 0, int? season = 3, int? episode = 7, string? episodeTitle = "Pilot")
     {
         timer.Status = "InProgress";
         ActivePaths[timer.TimerId] = path;
@@ -122,11 +144,11 @@ internal sealed class FakeRecordingHost : ILiveTvRecordingHost
             PostPaddingSeconds = timer.PostPaddingSeconds,
             SeriesId = "SH001",
             Name = "Storage Wars",
-            SeasonNumber = seriesSeason,
-            EpisodeNumber = seriesEpisode,
+            SeasonNumber = season,
+            EpisodeNumber = episode,
             EpisodeTitle = episodeTitle,
         };
-        FileSizes.TryAdd(path, 0);
+        Files.TryAdd(path, 0);
     }
 
     public void StopRecording(ScheduledTimer timer)
@@ -140,14 +162,23 @@ internal sealed class FakeRecordingHost : ILiveTvRecordingHost
     {
         foreach (var path in ActivePaths.Values)
         {
-            FileSizes[path] = FileSizes.GetValueOrDefault(path) + 1_000_000;
+            Files[path] = Files.GetValueOrDefault(path) + 1_000_000;
         }
+    }
+
+    public LibraryItem AddItem(string path, DateTime created)
+    {
+        var item = new LibraryItem { Id = Guid.NewGuid(), Path = path, DateCreated = created };
+        Items.Add(item);
+        Files.TryAdd(path, 1);
+        return item;
     }
 }
 
 public sealed class IncompleteRecordingTests : IDisposable
 {
     private static readonly DateTime Start = new(2026, 10, 22, 20, 0, 0, DateTimeKind.Utc);
+    private static readonly Guid User = Guid.NewGuid();
 
     private readonly string _dir = Path.Combine(Path.GetTempPath(), "moonfin-incomplete-" + Guid.NewGuid().ToString("N"));
     private readonly ManualTimeProvider _clock = new(Start.AddHours(-1));
@@ -164,6 +195,10 @@ public sealed class IncompleteRecordingTests : IDisposable
 
     private string StorePath => Path.Combine(_dir, "store.json");
 
+    private IncompleteRecordingStoreData Store =>
+        System.Text.Json.JsonSerializer.Deserialize<IncompleteRecordingStoreData>(File.ReadAllText(StorePath))!;
+
+    // A new instance is a new server process.
     private IncompleteRecordingService NewService() =>
         new(_host, new NoOpLogger<IncompleteRecordingService>(), _clock, StorePath, () => _settings);
 
@@ -184,7 +219,7 @@ public sealed class IncompleteRecordingTests : IDisposable
         return timer;
     }
 
-    private GuideProgram AddAiring(string id, DateTime start, string channel = "KABC", bool hd = false, int season = 3, int episode = 7, string? title = "Pilot", string seriesId = "SH001")
+    private GuideProgram AddAiring(string id, DateTime start, string channel = "KABC", bool hd = false, int? season = 3, int? episode = 7, string? title = "Pilot", string? seriesId = "SH001")
     {
         var program = new GuideProgram
         {
@@ -203,7 +238,7 @@ public sealed class IncompleteRecordingTests : IDisposable
         return program;
     }
 
-    /// <summary>Runs the service once a minute until the clock reaches the given time.</summary>
+    /// <summary>Runs the service once a minute until the clock reaches the given time, writing to active files.</summary>
     private async Task RunUntil(IncompleteRecordingService service, DateTime until, Action<DateTime>? each = null)
     {
         while (_clock.UtcNow < until)
@@ -215,11 +250,8 @@ public sealed class IncompleteRecordingTests : IDisposable
         }
     }
 
-    private static IncompleteRecordingStoreData ReadStore(string path) =>
-        System.Text.Json.JsonSerializer.Deserialize<IncompleteRecordingStoreData>(File.ReadAllText(path))!;
-
-    // Records a 30-minute show with 2 + 5 minutes of padding, writing only between the given
-    // minutes after the window opens.
+    // Records a 30-minute show with 2 + 5 minutes of padding (37 minutes, 33.3 needed at 90%),
+    // writing only between the given minutes after the window opens.
     private async Task<IncompleteRecordingService> RecordAiring(int fromMinute, int toMinute, string path = "/rec/a.ts", ScheduledTimer? timer = null, IncompleteRecordingService? service = null)
     {
         timer ??= AddTimer();
@@ -245,6 +277,11 @@ public sealed class IncompleteRecordingTests : IDisposable
         return service;
     }
 
+    private static RecordingFragment Fragment(double coveredMinutes, double unknownMinutes = 0) =>
+        new() { CoveredSeconds = coveredMinutes * 60, UnknownSeconds = unknownMinutes * 60 };
+
+    // Rules
+
     [Theory]
     [InlineData(32, 37, true)]
     [InlineData(35, 37, false)]
@@ -252,7 +289,6 @@ public sealed class IncompleteRecordingTests : IDisposable
     [InlineData(33.2, 37, true)]
     public void ThresholdIncludesPadding(double recorded, double expected, bool incomplete)
     {
-        // A 30-minute show with 2 + 5 minutes of padding needs 33.3 minutes at 90%.
         Assert.Equal(incomplete, IncompleteRecordingRules.IsIncomplete(recorded, expected, 90));
     }
 
@@ -265,6 +301,28 @@ public sealed class IncompleteRecordingTests : IDisposable
     }
 
     [Fact]
+    public void TwoPartialFilesAreNotACompleteCopy()
+    {
+        // A 60-minute episode split into two 29-minute files: together 97%, but neither plays whole.
+        var verdict = IncompleteRecordingRules.Classify(new[] { Fragment(29), Fragment(29) }, 60, 90);
+        Assert.Equal(RecordingVerdict.Incomplete, verdict);
+    }
+
+    [Fact]
+    public void OneSufficientFileIsComplete()
+    {
+        Assert.Equal(RecordingVerdict.Complete, IncompleteRecordingRules.Classify(new[] { Fragment(5), Fragment(55) }, 60, 90));
+    }
+
+    [Fact]
+    public void UnobservedTimeThatCouldDecideTheVerdictMakesItUnknown()
+    {
+        Assert.Equal(RecordingVerdict.Unknown, IncompleteRecordingRules.Classify(new[] { Fragment(45, 10) }, 60, 90));
+        Assert.Equal(RecordingVerdict.Incomplete, IncompleteRecordingRules.Classify(new[] { Fragment(30, 10) }, 60, 90));
+        Assert.Equal(RecordingVerdict.Incomplete, IncompleteRecordingRules.Classify(Array.Empty<RecordingFragment>(), 60, 90));
+    }
+
+    [Fact]
     public void EpisodeKeyNeedsSeasonAndEpisodeNumbers()
     {
         Assert.Null(EpisodeKey.Create("SH1", "News", null, 4, null));
@@ -274,30 +332,46 @@ public sealed class IncompleteRecordingTests : IDisposable
     }
 
     [Fact]
-    public void EpisodeTitlesAreComparedOnlyWhenBothHaveOne()
+    public void ThePersistedKeyIgnoresTheTitleAndNamespacesTheSeries()
     {
-        var key = EpisodeKey.Create("SH1", "Storage Wars", 3, 7, "Pilot")!;
-        Assert.True(key.MatchesAiring(EpisodeKey.Create("SH1", "Storage Wars", 3, 7, null)!));
-        Assert.True(key.MatchesAiring(EpisodeKey.Create("SH1", "Storage Wars", 3, 7, " pilot ")!));
-        Assert.False(key.MatchesAiring(EpisodeKey.Create("SH1", "Storage Wars", 3, 7, "Finale")!));
-        Assert.False(key.MatchesAiring(EpisodeKey.Create("SH1", "Storage Wars", 3, 8, "Pilot")!));
+        var titled = EpisodeKey.Create("SH1", "Storage Wars", 3, 7, "Pilot")!;
+        var untitled = EpisodeKey.Create("sh1", "Other Name", 3, 7, null)!;
+        var byName = EpisodeKey.Create(null, "  Storage   WARS ", 3, 7, null)!;
+
+        Assert.Equal(titled.Id, untitled.Id);
+        Assert.Equal("id:sh1|3|7", titled.Id);
+        Assert.Equal("name:storage wars|3|7", byName.Id);
+    }
+
+    [Fact]
+    public void TitlesAreCheckedAgainstTheAnchorNotChained()
+    {
+        var anchor = EpisodeKey.Create("SH1", "Storage Wars", 3, 7, null)!;
+        var pilot = EpisodeKey.Create("SH1", "Storage Wars", 3, 7, "Pilot")!;
+        var finale = EpisodeKey.Create("SH1", "Storage Wars", 3, 7, "Finale")!;
+
+        // An untitled anchor accepts either, but a titled one never accepts a different title,
+        // so "Pilot" and "Finale" can't be joined through the untitled airing.
+        Assert.True(anchor.Matches(pilot));
+        Assert.True(anchor.Matches(finale));
+        Assert.False(pilot.Matches(finale));
+        Assert.True(pilot.Matches(anchor));
     }
 
     [Fact]
     public void SeriesIdIsComparedWhenBothHaveOneAndTheNameOtherwise()
     {
         var withId = EpisodeKey.Create("SH1", "Storage Wars", 3, 7, null)!;
-        Assert.False(withId.MatchesAiring(EpisodeKey.Create("SH2", "Storage Wars", 3, 7, null)!));
-        Assert.True(withId.MatchesAiring(EpisodeKey.Create("SH1", "Renamed", 3, 7, null)!));
-        Assert.True(withId.MatchesAiring(EpisodeKey.Create(null, "storage wars", 3, 7, null)!));
-        Assert.False(withId.MatchesAiring(EpisodeKey.Create(null, "Other Show", 3, 7, null)!));
+        Assert.False(withId.Matches(EpisodeKey.Create("SH2", "Storage Wars", 3, 7, null)!));
+        Assert.True(withId.Matches(EpisodeKey.Create("SH1", "Renamed", 3, 7, null)!));
+        Assert.True(withId.Matches(EpisodeKey.Create(null, "storage  wars", 3, 7, null)!));
+        Assert.False(withId.Matches(EpisodeKey.Create(null, "Other Show", 3, 7, null)!));
     }
 
     [Fact]
     public void ChoosesTheEarliestLaterShowingPreferringHd()
     {
         var key = EpisodeKey.Create("SH1", "Storage Wars", 3, 7, null)!;
-        var now = Start;
         GuideProgram Airing(string id, int hoursLater, bool hd, int episode = 7) => new()
         {
             Id = id,
@@ -305,8 +379,8 @@ public sealed class IncompleteRecordingTests : IDisposable
             SeriesName = "Storage Wars",
             Season = 3,
             Episode = episode,
-            StartDate = now.AddHours(hoursLater),
-            EndDate = now.AddHours(hoursLater).AddMinutes(30),
+            StartDate = Start.AddHours(hoursLater),
+            EndDate = Start.AddHours(hoursLater).AddMinutes(30),
             IsHD = hd,
         };
 
@@ -319,9 +393,11 @@ public sealed class IncompleteRecordingTests : IDisposable
             Airing("later", 5, true),
         };
 
-        Assert.Equal("hd", IncompleteRecordingRules.ChooseShowing(key, programs, now)?.Id);
-        Assert.Null(IncompleteRecordingRules.ChooseShowing(key, programs.Take(2), now));
+        Assert.Equal("hd", IncompleteRecordingRules.ChooseShowing(key, programs, Start)?.Id);
+        Assert.Null(IncompleteRecordingRules.ChooseShowing(key, programs.Take(2), Start));
     }
+
+    // Measuring
 
     [Fact]
     public async Task LosingTheEndingFlagsTheRecordingAndSchedulesTheLaterShowing()
@@ -329,30 +405,29 @@ public sealed class IncompleteRecordingTests : IDisposable
         AddAiring("p2", Start.AddDays(2));
         AddAiring("p3", Start.AddDays(1));
 
-        // Writes from the start of the window, but stops 7 minutes before it closes.
         await RecordAiring(0, 30);
 
-        var data = ReadStore(StorePath);
-        var record = Assert.Single(data.Records);
-        Assert.InRange(record.RecordedMinutes, 29, 31);
+        var record = Assert.Single(Store.Records);
+        Assert.InRange(record.RecordedMinutes, 28.5, 30);
         Assert.Equal(37, record.ExpectedMinutes);
-        var request = Assert.Single(data.Requests);
+        var request = Assert.Single(Store.Requests);
         Assert.Equal(CompleteShowingState.Scheduled, request.State);
         Assert.Equal("p3", request.ScheduledProgramId);
         Assert.Equal(new[] { "p3" }, _host.Scheduled);
     }
 
     [Fact]
-    public async Task MissingOnlyThePreRollIsNotFlagged()
+    public async Task AWatchedLateStartIsNotUnobservedTime()
     {
         AddAiring("p2", Start.AddDays(1));
 
         await RecordAiring(2, 37);
 
-        var data = ReadStore(StorePath);
-        Assert.Empty(data.Records);
+        var snapshot = Assert.Single(Store.Snapshots);
+        Assert.Equal(RecordingVerdict.Complete, snapshot.Verdict);
+        Assert.InRange(Assert.Single(snapshot.Fragments).UnknownSeconds, 0, 121);
+        Assert.Empty(Store.Records);
         Assert.Empty(_host.Scheduled);
-        Assert.True(Assert.Single(data.Snapshots).Complete);
     }
 
     [Fact]
@@ -382,8 +457,31 @@ public sealed class IncompleteRecordingTests : IDisposable
             _clock.Advance(TimeSpan.FromMinutes(1));
         }
 
-        var record = Assert.Single(ReadStore(StorePath).Records);
-        Assert.InRange(record.RecordedMinutes, 21, 23);
+        var record = Assert.Single(Store.Records);
+        Assert.InRange(record.RecordedMinutes, 20, 23);
+    }
+
+    [Fact]
+    public async Task MissedSamplesAreUnknownAndCanLeaveTheVerdictUnknown()
+    {
+        var timer = AddTimer();
+        var service = NewService();
+        await service.RunAsync(CancellationToken.None);
+        _clock.UtcNow = timer.WindowStart;
+        _host.StartRecording(timer, "/rec/a.ts");
+        await RunUntil(service, timer.WindowStart.AddMinutes(10));
+
+        // The file keeps growing, but the plugin misses ten minutes of samples in the same process.
+        _host.Write();
+        _clock.Advance(TimeSpan.FromMinutes(10));
+        await RunUntil(service, timer.WindowEnd);
+        _host.StopRecording(timer);
+        await RunUntil(service, timer.WindowEnd.AddMinutes(1));
+
+        var snapshot = Assert.Single(Store.Snapshots);
+        Assert.Equal(RecordingVerdict.Unknown, snapshot.Verdict);
+        Assert.InRange(snapshot.Fragments[0].UnknownSeconds, 600, 800);
+        Assert.Empty(Store.Records);
     }
 
     [Fact]
@@ -394,14 +492,12 @@ public sealed class IncompleteRecordingTests : IDisposable
         var service = NewService();
         await service.RunAsync(CancellationToken.None);
 
-        // First seen on a retry: the server has already rewritten the timer's start.
         _clock.UtcNow = Start.AddMinutes(10);
         _host.StartRecording(timer, "/rec/a.ts", retryCount: 1);
         _host.ActiveTimers["/rec/a.ts"].StartDate = _clock.UtcNow;
-        _host.Write();
         await service.RunAsync(CancellationToken.None);
 
-        var snapshot = Assert.Single(ReadStore(StorePath).Snapshots);
+        var snapshot = Assert.Single(Store.Snapshots);
         Assert.Equal(30, snapshot.RuntimeMinutes);
         Assert.Equal(0, snapshot.PrePaddingMinutes);
         Assert.Equal(0, snapshot.PostPaddingMinutes);
@@ -416,18 +512,17 @@ public sealed class IncompleteRecordingTests : IDisposable
         await service.RunAsync(CancellationToken.None);
         _clock.UtcNow = timer.WindowStart;
         _host.StartRecording(timer, "/rec/a.ts");
-        _host.Write();
         await service.RunAsync(CancellationToken.None);
 
-        var snapshot = Assert.Single(ReadStore(StorePath).Snapshots);
+        var snapshot = Assert.Single(Store.Snapshots);
         Assert.Equal(30, snapshot.RuntimeMinutes);
         Assert.Equal(2, snapshot.PrePaddingMinutes);
         Assert.Equal(5, snapshot.PostPaddingMinutes);
-        Assert.Equal("Storage Wars", snapshot.Episode?.SeriesName);
+        Assert.Equal("id:sh001|3|7", snapshot.Episode?.Id);
     }
 
     [Fact]
-    public async Task AStopAndRestartAddsUpToOneRecordAndOneRequest()
+    public async Task AStopAndRestartKeepsSeparateFilesAndBadgesBoth()
     {
         AddAiring("p2", Start.AddDays(1));
         var timer = AddTimer();
@@ -441,11 +536,11 @@ public sealed class IncompleteRecordingTests : IDisposable
             {
                 _host.StartRecording(timer, "/rec/a.ts");
             }
-            else if (minute == 10)
+            else if (minute == 18)
             {
                 _host.StopRecording(timer);
             }
-            else if (minute == 20)
+            else if (minute == 19)
             {
                 _host.StartRecording(timer, "/rec/a-1.ts");
             }
@@ -454,16 +549,22 @@ public sealed class IncompleteRecordingTests : IDisposable
                 _host.StopRecording(timer);
             }
         });
+        var first = _host.AddItem("/rec/a.ts", _clock.UtcNow);
+        var second = _host.AddItem("/rec/a-1.ts", _clock.UtcNow);
+        await service.OnItemAddedAsync(first, CancellationToken.None);
+        await service.OnItemAddedAsync(second, CancellationToken.None);
 
-        var data = ReadStore(StorePath);
-        var record = Assert.Single(data.Records);
-        Assert.Equal(new[] { "/rec/a.ts", "/rec/a-1.ts" }, record.FragmentPaths);
-        Assert.Single(data.Requests);
+        // 18 + 18 minutes would pass if added together; one file each is incomplete.
+        var record = Assert.Single(Store.Records);
+        Assert.Equal(new[] { "/rec/a.ts", "/rec/a-1.ts" }, record.Fragments.Select(f => f.Path));
+        Assert.Contains(IncompleteRecordingRules.Tag, first.Tags);
+        Assert.Contains(IncompleteRecordingRules.Tag, second.Tags);
+        Assert.Single(Store.Requests);
         Assert.Single(_host.Scheduled);
     }
 
     [Fact]
-    public async Task ARestartMidRecordingKeepsTheSnapshotAndTheGapDoesntCount()
+    public async Task ARebootGapIsNeverCredited()
     {
         AddAiring("p2", Start.AddDays(1));
         var timer = AddTimer();
@@ -473,102 +574,155 @@ public sealed class IncompleteRecordingTests : IDisposable
         _host.StartRecording(timer, "/rec/a.ts");
         await RunUntil(first, timer.WindowStart.AddMinutes(15));
 
-        // The server goes down for ten minutes, then the recording restarts in a new file.
-        _host.StopRecording(timer);
+        // The server is down for ten minutes. The new process's recorder writes to the same file
+        // name and the file is bigger than before, but none of the gap counts.
+        _host.Write();
         _clock.Advance(TimeSpan.FromMinutes(10));
         var second = NewService();
-        _host.StartRecording(timer, "/rec/a-1.ts", retryCount: 1);
-        await RunUntil(second, timer.WindowEnd, _ => { });
+        _host.StartRecording(timer, "/rec/a.ts", retryCount: 1);
+        await RunUntil(second, timer.WindowEnd);
         _host.StopRecording(timer);
         await RunUntil(second, timer.WindowEnd.AddMinutes(1));
 
-        var data = ReadStore(StorePath);
-        var record = Assert.Single(data.Records);
-        Assert.InRange(record.RecordedMinutes, 25, 28);
-        Assert.Equal(2, record.FragmentPaths.Count);
-        Assert.Single(data.Requests);
+        var fragments = Assert.Single(Store.Records).Fragments;
+        Assert.Equal(2, fragments.Count);
+        Assert.All(fragments, f => Assert.True(f.CoveredSeconds <= 15 * 60));
+        // Each file's only unobserved time is the minute after its last sample.
+        Assert.All(fragments, f => Assert.InRange(f.UnknownSeconds, 0, 60));
+        Assert.Single(Store.Requests);
     }
 
     [Fact]
-    public async Task APluginStartedMidRecordingGivesTheUnseenMinutesTheBenefitOfTheDoubt()
+    public async Task ARecordingInterruptedByTheRestartThatInstalledThePluginIsJudgedOnWhatThisProcessSaw()
     {
+        // The plugin first sees this recording after the server started, so only what this
+        // process observed is counted.
         var timer = AddTimer();
         _clock.UtcNow = timer.WindowStart.AddMinutes(20);
-        _host.StartRecording(timer, "/rec/a.ts");
+        _host.StartRecording(timer, "/rec/a.ts", retryCount: 1);
         var service = NewService();
-        await RunUntil(service, timer.WindowEnd, _ => { });
+        await RunUntil(service, timer.WindowEnd);
         _host.StopRecording(timer);
         await RunUntil(service, timer.WindowEnd.AddMinutes(1));
 
-        Assert.Empty(ReadStore(StorePath).Records);
+        var snapshot = Assert.Single(Store.Snapshots);
+        Assert.InRange(snapshot.Fragments[0].UnknownSeconds, 0, 60);
+        Assert.Equal(RecordingVerdict.Incomplete, snapshot.Verdict);
     }
 
     [Fact]
-    public async Task AttachesToTheItemAtTheOriginalPathAndTagsItOnce()
+    public async Task ARecordingTheCacheMissedIsJudgedUnknownRatherThanIncomplete()
     {
-        var item = new LibraryItem { Id = Guid.NewGuid(), Path = "/rec/a.ts" };
-        _host.Items.Add(item);
+        var service = NewService();
+        await service.RunAsync(CancellationToken.None);
+
+        // The timer appears only at the safety-net reload, fifteen minutes into its window.
+        var timer = AddTimer();
+        _host.StartRecording(timer, "/rec/a.ts");
+        _clock.UtcNow = timer.WindowStart.AddMinutes(15);
+        await RunUntil(service, timer.WindowEnd);
+        _host.StopRecording(timer);
+        await RunUntil(service, timer.WindowEnd.AddMinutes(1));
+
+        Assert.Equal(RecordingVerdict.Unknown, Assert.Single(Store.Snapshots).Verdict);
+        Assert.Empty(Store.Records);
+    }
+
+    // Attaching
+
+    [Fact]
+    public async Task AnItemAddedBeforeTheJudgmentIsReconciledAtJudging()
+    {
+        // The server refreshes the library as the recording starts, so the item exists first.
+        var item = _host.AddItem("/rec/a.ts", Start.AddMinutes(-2));
 
         await RecordAiring(0, 20);
 
-        var record = Assert.Single(ReadStore(StorePath).Records);
-        Assert.Equal(new[] { item.Id }, record.ItemIds);
+        Assert.Equal(new[] { item.Id }, Assert.Single(Store.Records).ItemIds);
         Assert.Equal(new[] { IncompleteRecordingRules.Tag }, item.Tags);
     }
 
     [Fact]
-    public async Task AMovedFileAttachesByEpisodeWithinADay()
+    public async Task AFileRenamedInPlaceAttaches()
     {
         var service = await RecordAiring(0, 20);
-        var moved = new LibraryItem
-        {
-            Id = Guid.NewGuid(),
-            Path = "/library/Storage Wars/S03E07.mkv",
-            SeriesName = "Storage Wars",
-            Season = 3,
-            Episode = 7,
-            DateCreated = _clock.UtcNow,
-        };
-        _host.Items.Add(moved);
-        _clock.Advance(TimeSpan.FromHours(3));
-        await service.OnItemAddedAsync(moved, CancellationToken.None);
+        _host.Files.Remove("/rec/a.ts");
+        var remuxed = _host.AddItem("/rec/a.mkv", _clock.UtcNow);
+        await service.OnItemAddedAsync(remuxed, CancellationToken.None);
 
-        Assert.Equal(new[] { moved.Id }, Assert.Single(ReadStore(StorePath).Records).ItemIds);
-        Assert.Contains(IncompleteRecordingRules.Tag, moved.Tags);
+        Assert.Equal(new[] { remuxed.Id }, Assert.Single(Store.Records).ItemIds);
+        Assert.Contains(IncompleteRecordingRules.Tag, remuxed.Tags);
     }
 
     [Fact]
-    public async Task NothingAttachesAfterADay()
+    public async Task AnotherCopyOfTheSameEpisodeIsNeverAttached()
+    {
+        var service = await RecordAiring(0, 20);
+        _host.Files.Remove("/rec/a.ts");
+
+        // The same episode, recorded completely somewhere else.
+        var elsewhere = _host.AddItem("/library/Storage Wars/S03E07.mkv", _clock.UtcNow);
+        await service.OnItemAddedAsync(elsewhere, CancellationToken.None);
+
+        Assert.Empty(Assert.Single(Store.Records).ItemIds);
+        Assert.Empty(elsewhere.Tags);
+    }
+
+    [Fact]
+    public async Task AnAmbiguousRenameIsLeftUnattached()
+    {
+        var service = await RecordAiring(0, 20);
+        _host.Files.Remove("/rec/a.ts");
+        _host.Files["/rec/a.srt"] = 1;
+        var remuxed = _host.AddItem("/rec/a.mkv", _clock.UtcNow);
+        await service.OnItemAddedAsync(remuxed, CancellationToken.None);
+
+        Assert.Empty(remuxed.Tags);
+    }
+
+    [Fact]
+    public async Task ARenameIsIgnoredWhileTheOriginalStillExists()
+    {
+        var service = await RecordAiring(0, 20);
+        var transcode = _host.AddItem("/rec/a.mkv", _clock.UtcNow);
+        await service.OnItemAddedAsync(transcode, CancellationToken.None);
+
+        Assert.Empty(transcode.Tags);
+    }
+
+    [Fact]
+    public async Task NothingAttachesByRenameAfterADay()
     {
         var service = await RecordAiring(0, 20);
         _clock.Advance(TimeSpan.FromHours(25));
-        var late = new LibraryItem { Id = Guid.NewGuid(), Path = "/library/x.mkv", SeriesName = "Storage Wars", Season = 3, Episode = 7 };
-        _host.Items.Add(late);
+        _host.Files.Remove("/rec/a.ts");
+        var late = _host.AddItem("/rec/a.mkv", _clock.UtcNow);
         await service.OnItemAddedAsync(late, CancellationToken.None);
 
-        Assert.Empty(Assert.Single(ReadStore(StorePath).Records).ItemIds);
         Assert.Empty(late.Tags);
     }
 
     [Fact]
-    public async Task AFileOfACompleteRecordingIsNeverAttachedByEpisode()
+    public async Task AMoveAndADeletionBothDetachAndTheRecordLapsesAfterADay()
     {
+        AddAiring("p2", Start.AddDays(1));
+        var item = _host.AddItem("/rec/a.ts", Start);
         var service = await RecordAiring(0, 20);
 
-        var complete = AddTimer("t2", "p9", start: _clock.UtcNow.AddMinutes(10));
-        await RecordAiring(0, 37, "/rec/complete.ts", complete, service);
-        var item = new LibraryItem { Id = Guid.NewGuid(), Path = "/rec/complete.ts", SeriesName = "Storage Wars", Season = 3, Episode = 7 };
-        _host.Items.Add(item);
-        await service.OnItemAddedAsync(item, CancellationToken.None);
+        await service.OnItemRemovedAsync(item.Id, CancellationToken.None);
+        Assert.Single(Store.Records);
+        Assert.Empty(Store.Records[0].ItemIds);
 
-        Assert.Empty(item.Tags);
+        _clock.Advance(TimeSpan.FromHours(25));
+        await service.RunAsync(CancellationToken.None);
+        Assert.Empty(Store.Records);
+        Assert.Equal(CompleteShowingState.Scheduled, Assert.Single(Store.Requests).State);
     }
 
     [Fact]
     public async Task ATagGoneForAnyReasonDismissesTheRecordAndIsNeverAddedBack()
     {
-        var item = new LibraryItem { Id = Guid.NewGuid(), Path = "/rec/a.ts" };
-        _host.Items.Add(item);
+        var item = _host.AddItem("/rec/a.ts", Start);
         var service = await RecordAiring(0, 20);
 
         item.Tags = Array.Empty<string>();
@@ -576,34 +730,21 @@ public sealed class IncompleteRecordingTests : IDisposable
         await service.OnItemAddedAsync(item, CancellationToken.None);
         await service.RunAsync(CancellationToken.None);
 
-        Assert.True(Assert.Single(ReadStore(StorePath).Records).Dismissed);
+        Assert.True(Assert.Single(Store.Records).Dismissed);
         Assert.Empty(item.Tags);
-        Assert.Empty(await service.GetStatesAsync(new[] { item.Id }, CancellationToken.None));
+        Assert.Empty(await service.GetStatesAsync(new[] { item.Id }, User, CancellationToken.None));
     }
 
-    [Fact]
-    public async Task KeepAsCompleteDismissesAndRemovesTheTag()
-    {
-        var item = new LibraryItem { Id = Guid.NewGuid(), Path = "/rec/a.ts" };
-        _host.Items.Add(item);
-        var service = await RecordAiring(0, 20);
-
-        Assert.True(await service.DismissAsync(item.Id, CancellationToken.None));
-
-        Assert.Empty(item.Tags);
-        Assert.Empty(await service.GetStatesAsync(new[] { item.Id }, CancellationToken.None));
-        Assert.False(await service.DismissAsync(Guid.NewGuid(), CancellationToken.None));
-    }
+    // Display and permissions
 
     [Fact]
     public async Task TheStateShowsTheScheduledShowing()
     {
         var later = AddAiring("p2", Start.AddDays(1), channel: "KABC-HD");
-        var item = new LibraryItem { Id = Guid.NewGuid(), Path = "/rec/a.ts" };
-        _host.Items.Add(item);
+        var item = _host.AddItem("/rec/a.ts", Start);
         var service = await RecordAiring(0, 20);
 
-        var state = Assert.Single(await service.GetStatesAsync(new[] { item.Id, Guid.NewGuid() }, CancellationToken.None));
+        var state = Assert.Single(await service.GetStatesAsync(new[] { item.Id, Guid.NewGuid() }, User, CancellationToken.None));
         Assert.Equal("scheduled", state.State);
         Assert.Equal(later.StartDate, state.ScheduledStart);
         Assert.Equal("KABC-HD", state.ChannelName);
@@ -611,35 +752,72 @@ public sealed class IncompleteRecordingTests : IDisposable
     }
 
     [Fact]
-    public async Task WithoutItemIdsEveryIncompleteItemIsReturned()
+    public async Task WithoutItemIdsEveryVisibleIncompleteItemIsReturned()
     {
-        var item = new LibraryItem { Id = Guid.NewGuid(), Path = "/rec/a.ts" };
-        _host.Items.Add(item);
+        var item = _host.AddItem("/rec/a.ts", Start);
         var service = await RecordAiring(0, 20);
 
-        var state = Assert.Single(await service.GetStatesAsync(null, CancellationToken.None));
-        Assert.Equal(item.Id.ToString("N"), state.ItemId);
+        Assert.Equal(item.Id.ToString("N"), Assert.Single(await service.GetStatesAsync(null, User, CancellationToken.None)).ItemId);
 
-        await service.DismissAsync(item.Id, CancellationToken.None);
-        Assert.Empty(await service.GetStatesAsync(null, CancellationToken.None));
+        _host.Hidden.Add(item.Id);
+        Assert.Empty(await service.GetStatesAsync(null, User, CancellationToken.None));
+        Assert.False(await service.DismissAsync(item.Id, User, CancellationToken.None));
     }
+
+    [Fact]
+    public async Task AHiddenProgramCantBeRequested()
+    {
+        var program = AddAiring("6f1c2c58a1e34c1f9a8b3d2e1f0a9b8c", Start);
+        _host.Hidden.Add(Guid.Parse(program.Id));
+
+        var (request, refusal) = await NewService().RequestCompleteShowingAsync(program.Id, User, CancellationToken.None);
+
+        Assert.Null(request);
+        Assert.Equal(CompleteShowingRefusal.NotFound, refusal);
+    }
+
+    [Fact]
+    public async Task AProgramWithoutEpisodeNumbersGetsNoRequest()
+    {
+        AddAiring("0b9e8c1d2f3a4b5c6d7e8f9a0b1c2d3e", Start, season: null, episode: null);
+
+        var (request, refusal) = await NewService().RequestCompleteShowingAsync("0b9e8c1d2f3a4b5c6d7e8f9a0b1c2d3e", User, CancellationToken.None);
+
+        Assert.Null(request);
+        Assert.Equal(CompleteShowingRefusal.NoEpisodeNumbers, refusal);
+    }
+
+    [Fact]
+    public async Task AProgramWithoutEpisodeNumbersIsStillFlaggedByPath()
+    {
+        var timer = AddTimer();
+        var item = _host.AddItem("/rec/news.ts", Start);
+        var service = NewService();
+        await service.RunAsync(CancellationToken.None);
+        _clock.UtcNow = timer.WindowStart;
+        _host.StartRecording(timer, "/rec/news.ts", season: null, episode: null);
+        await RunUntil(service, timer.WindowStart.AddMinutes(10));
+        _host.StopRecording(timer);
+        await RunUntil(service, timer.WindowEnd.AddMinutes(1));
+
+        Assert.Equal(new[] { item.Id }, Assert.Single(Store.Records).ItemIds);
+        Assert.Empty(Store.Requests);
+    }
+
+    // Requests
 
     [Fact]
     public async Task ACompleteReplacementMarksTheRequestRecorded()
     {
         var later = AddAiring("p2", Start.AddDays(1));
-        var item = new LibraryItem { Id = Guid.NewGuid(), Path = "/rec/a.ts" };
-        _host.Items.Add(item);
+        var item = _host.AddItem("/rec/a.ts", Start);
         var service = await RecordAiring(0, 20);
 
         var replacement = _host.Timers.Single(t => t.ProgramId == "p2");
-        replacement.PrePaddingSeconds = 120;
-        replacement.PostPaddingSeconds = 300;
         await RecordAiring(0, 37, "/rec/b.ts", replacement, service);
 
-        var state = Assert.Single(await service.GetStatesAsync(new[] { item.Id }, CancellationToken.None));
-        Assert.Equal("recorded", state.State);
-        Assert.Equal(CompleteShowingState.Done, Assert.Single(ReadStore(StorePath).Requests).State);
+        Assert.Equal("recorded", Assert.Single(await service.GetStatesAsync(new[] { item.Id }, User, CancellationToken.None)).State);
+        Assert.Equal(CompleteShowingState.Done, Assert.Single(Store.Requests).State);
         Assert.Equal(later.Id, _host.Scheduled.Single());
     }
 
@@ -657,24 +835,30 @@ public sealed class IncompleteRecordingTests : IDisposable
             await RecordAiring(0, 10, "/rec/" + programId + ".ts", replacement, service);
         }
 
-        var request = Assert.Single(ReadStore(StorePath).Requests);
-        Assert.Equal(CompleteShowingState.GaveUp, request.State);
+        Assert.Equal(CompleteShowingState.GaveUp, Assert.Single(Store.Requests).State);
         Assert.Equal(new[] { "p2", "p3" }, _host.Scheduled);
-        Assert.Equal(3, ReadStore(StorePath).Records.Count);
+        Assert.Equal(3, Store.Snapshots.Count(s => s.Verdict == RecordingVerdict.Incomplete));
     }
 
     [Fact]
-    public async Task AShowingSomeoneAlreadyScheduledIsFollowedWithoutASecondTimer()
+    public async Task AnAdoptedTimerIsFollowedAndUsesAnAttempt()
     {
         AddAiring("p2", Start.AddDays(1));
-        AddTimer("other", "p2", start: Start.AddDays(1));
+        AddAiring("p3", Start.AddDays(2));
+        var adopted = AddTimer("someone-elses", "p2", start: Start.AddDays(1));
+        var service = await RecordAiring(0, 20);
 
-        await RecordAiring(0, 20);
-
-        Assert.Empty(_host.Scheduled);
-        var request = Assert.Single(ReadStore(StorePath).Requests);
+        var request = Assert.Single(Store.Requests);
         Assert.Equal(CompleteShowingState.Scheduled, request.State);
         Assert.Equal("p2", request.ScheduledProgramId);
+        Assert.Empty(_host.Scheduled);
+
+        // The adopted showing comes out incomplete too, so the next one is scheduled.
+        await RecordAiring(0, 10, "/rec/p2.ts", adopted, service);
+        request = Assert.Single(Store.Requests);
+        Assert.Equal(1, request.FailedAttempts);
+        Assert.Equal("p3", request.ScheduledProgramId);
+        Assert.Equal(new[] { "p3" }, _host.Scheduled);
     }
 
     [Fact]
@@ -688,11 +872,55 @@ public sealed class IncompleteRecordingTests : IDisposable
 
         Assert.Equal(new[] { "p2" }, _host.Scheduled);
         Assert.Equal("New", grey.Status);
-        Assert.Equal(CompleteShowingState.Scheduled, Assert.Single(ReadStore(StorePath).Requests).State);
+        Assert.Equal(CompleteShowingState.Scheduled, Assert.Single(Store.Requests).State);
     }
 
     [Fact]
-    public async Task CancellingTheScheduledShowingIsFinal()
+    public async Task ACrashAfterTheServerMadeTheTimerDoesntScheduleItTwice()
+    {
+        AddAiring("p2", Start.AddDays(1));
+        AddAiring("p3", Start.AddDays(2));
+        _host.CrashAfterNextSchedule = true;
+        var timer = AddTimer();
+        var service = NewService();
+        await service.RunAsync(CancellationToken.None);
+        _clock.UtcNow = timer.WindowStart;
+        _host.StartRecording(timer, "/rec/a.ts");
+        await RunUntil(service, timer.WindowStart.AddMinutes(10));
+        _host.StopRecording(timer);
+        _clock.UtcNow = timer.WindowEnd;
+        await Assert.ThrowsAsync<InvalidOperationException>(() => service.RunAsync(CancellationToken.None));
+        Assert.Equal("p2", Assert.Single(Store.Requests).PendingProgramId);
+
+        // After the restart the saved intent is reconciled against the server's timers.
+        var restarted = NewService();
+        _clock.Advance(TimeSpan.FromMinutes(1));
+        await restarted.RunAsync(CancellationToken.None);
+
+        Assert.Equal(new[] { "p2" }, _host.Scheduled);
+        var request = Assert.Single(Store.Requests);
+        Assert.Equal(CompleteShowingState.Scheduled, request.State);
+        Assert.Null(request.PendingProgramId);
+    }
+
+    [Fact]
+    public async Task AnExplicitRequestIsIdempotent()
+    {
+        var now = AddAiring("6a1b2c3d4e5f60718293a4b5c6d7e8f9", Start);
+        AddAiring("p2", Start.AddDays(1));
+        _clock.UtcNow = Start.AddMinutes(10);
+        var service = NewService();
+
+        var (first, _) = await service.RequestCompleteShowingAsync(now.Id, User, CancellationToken.None);
+        var (second, _) = await service.RequestCompleteShowingAsync(now.Id, User, CancellationToken.None);
+
+        Assert.Equal(first!.Id, second!.Id);
+        Assert.Single(Store.Requests);
+        Assert.Equal(new[] { "p2" }, _host.Scheduled);
+    }
+
+    [Fact]
+    public async Task CancellingTheScheduledShowingIsFinalEvenAfterAGuideRefresh()
     {
         AddAiring("p2", Start.AddDays(1));
         AddAiring("p3", Start.AddDays(2));
@@ -704,8 +932,26 @@ public sealed class IncompleteRecordingTests : IDisposable
         service.MarkGuideRefreshed();
         await service.RunAsync(CancellationToken.None);
 
-        Assert.Equal(CompleteShowingState.CancelledByUser, Assert.Single(ReadStore(StorePath).Requests).State);
+        Assert.Equal(CompleteShowingState.CancelledByUser, Assert.Single(Store.Requests).State);
         Assert.Equal(new[] { "p2" }, _host.Scheduled);
+    }
+
+    [Fact]
+    public async Task ASeriesRuleMovingTheShowingIsFollowedNotTakenAsACancel()
+    {
+        AddAiring("p2", Start.AddDays(1));
+        AddAiring("p3", Start.AddDays(2), hd: true);
+        var service = await RecordAiring(0, 20);
+
+        // The series rule cancels the plugin's pick and records the HD airing instead.
+        _host.Timers.Single(t => t.ProgramId == "p2").Status = "Cancelled";
+        AddTimer("series-hd", "p3", start: Start.AddDays(2));
+        service.MarkScheduleChanged();
+        await service.RunAsync(CancellationToken.None);
+
+        var request = Assert.Single(Store.Requests);
+        Assert.Equal(CompleteShowingState.Scheduled, request.State);
+        Assert.Equal("p3", request.ScheduledProgramId);
     }
 
     [Fact]
@@ -720,21 +966,20 @@ public sealed class IncompleteRecordingTests : IDisposable
         service.MarkGuideRefreshed();
         await service.RunAsync(CancellationToken.None);
 
-        var request = Assert.Single(ReadStore(StorePath).Requests);
-        Assert.Equal("p5", request.ScheduledProgramId);
+        Assert.Equal("p5", Assert.Single(Store.Requests).ScheduledProgramId);
     }
 
     [Fact]
-    public async Task AWaitingRequestIsSearchedAfterGuideRefreshesUntilSixtyDays()
+    public async Task AWaitingRequestIsSearchedAfterGuideRefreshes()
     {
         var service = await RecordAiring(0, 20);
-        Assert.Equal(CompleteShowingState.Waiting, Assert.Single(ReadStore(StorePath).Requests).State);
+        Assert.Equal(CompleteShowingState.Waiting, Assert.Single(Store.Requests).State);
 
         _clock.Advance(TimeSpan.FromDays(10));
         AddAiring("p2", _clock.UtcNow.AddDays(1));
         service.MarkGuideRefreshed();
         await service.RunAsync(CancellationToken.None);
-        Assert.Equal(CompleteShowingState.Scheduled, Assert.Single(ReadStore(StorePath).Requests).State);
+        Assert.Equal(CompleteShowingState.Scheduled, Assert.Single(Store.Requests).State);
     }
 
     [Fact]
@@ -746,7 +991,7 @@ public sealed class IncompleteRecordingTests : IDisposable
         service.MarkGuideRefreshed();
         await service.RunAsync(CancellationToken.None);
 
-        Assert.Equal(CompleteShowingState.NotFound, Assert.Single(ReadStore(StorePath).Requests).State);
+        Assert.Equal(CompleteShowingState.NotFound, Assert.Single(Store.Requests).State);
     }
 
     [Fact]
@@ -757,110 +1002,96 @@ public sealed class IncompleteRecordingTests : IDisposable
 
         await RecordAiring(0, 20);
 
-        var data = ReadStore(StorePath);
-        Assert.Single(data.Records);
-        Assert.Empty(data.Requests);
+        Assert.Single(Store.Records);
+        Assert.Empty(Store.Requests);
         Assert.Empty(_host.Scheduled);
     }
 
     [Fact]
-    public async Task TurningTheSettingOffDropsWaitingAutomaticRequestsButNotExplicitOnes()
+    public async Task TurningTheSettingOffKeepsARequestAnExplicitOneFoldedInto()
     {
         var service = await RecordAiring(0, 20);
-        var other = AddAiring("other-now", _clock.UtcNow.AddMinutes(-5), episode: 9);
-        await service.RequestCompleteShowingAsync(other.Id, CancellationToken.None);
-        Assert.Equal(2, ReadStore(StorePath).Requests.Count);
+        Assert.Equal(CompleteShowingState.Waiting, Assert.Single(Store.Requests).State);
+
+        // Someone asks explicitly for the same episode, which joins the automatic request.
+        var airing = AddAiring("7d6c5b4a39281706f5e4d3c2b1a09f8e", _clock.UtcNow.AddMinutes(-5));
+        await service.RequestCompleteShowingAsync(airing.Id, User, CancellationToken.None);
 
         _settings.AutoRecordComplete = false;
         await service.RunAsync(CancellationToken.None);
 
-        var remaining = Assert.Single(ReadStore(StorePath).Requests);
-        Assert.True(remaining.Explicit);
-        Assert.Null(Assert.Single(ReadStore(StorePath).Records).RequestId);
+        Assert.True(Assert.Single(Store.Requests).Explicit);
     }
 
     [Fact]
-    public async Task AnExplicitRequestFoldsWithTheAutomaticOneForTheSameEpisode()
+    public async Task TurningTheSettingOffDropsWaitingAutomaticRequests()
     {
-        _settings.AutoRecordComplete = true;
-        var now = AddAiring("p1", Start);
-        AddAiring("p2", Start.AddDays(1));
-        _clock.UtcNow = Start.AddMinutes(10);
-
-        var service = NewService();
-        var request = await service.RequestCompleteShowingAsync(now.Id, CancellationToken.None);
-        Assert.Equal(CompleteShowingState.Scheduled, request?.State);
-
-        // The airing being recorded right now then comes out incomplete.
-        var timer = AddTimer();
-        _host.StartRecording(timer, "/rec/a.ts");
-        await RunUntil(service, timer.WindowEnd, _ => { });
-        _host.StopRecording(timer);
-        await RunUntil(service, timer.WindowEnd.AddMinutes(1));
-
-        var data = ReadStore(StorePath);
-        var single = Assert.Single(data.Requests);
-        Assert.Equal(single.Id, Assert.Single(data.Records).RequestId);
-        Assert.Equal(new[] { "p2" }, _host.Scheduled);
-    }
-
-    [Fact]
-    public async Task AProgramWithoutEpisodeNumbersGetsNoRequest()
-    {
-        var news = AddAiring("news", Start, season: 0, episode: 0);
-        news.Season = null;
-        news.Episode = null;
-
-        Assert.Null(await NewService().RequestCompleteShowingAsync("news", CancellationToken.None));
-        Assert.Null(await NewService().RequestCompleteShowingAsync("missing", CancellationToken.None));
-    }
-
-    [Fact]
-    public async Task AProgramWithoutEpisodeNumbersIsStillFlaggedByPath()
-    {
-        var timer = AddTimer();
-        var item = new LibraryItem { Id = Guid.NewGuid(), Path = "/rec/news.ts" };
-        _host.Items.Add(item);
-        var service = NewService();
+        var service = await RecordAiring(0, 20);
+        _settings.AutoRecordComplete = false;
         await service.RunAsync(CancellationToken.None);
-        _clock.UtcNow = timer.WindowStart;
-        _host.StartRecording(timer, "/rec/news.ts", seriesSeason: null, seriesEpisode: null);
-        await RunUntil(service, timer.WindowStart.AddMinutes(10));
-        _host.StopRecording(timer);
-        await RunUntil(service, timer.WindowEnd.AddMinutes(1));
 
-        var data = ReadStore(StorePath);
-        Assert.Equal(new[] { item.Id }, Assert.Single(data.Records).ItemIds);
-        Assert.Empty(data.Requests);
+        Assert.Empty(Store.Requests);
+        Assert.Null(Assert.Single(Store.Records).RequestId);
     }
 
     [Fact]
-    public async Task DeletingTheIncompleteCopyDropsTheRecordButKeepsTheRequest()
+    public async Task KeepAsCompleteClosesTheAutomaticRequestAndRemovesTheTag()
     {
         AddAiring("p2", Start.AddDays(1));
-        var item = new LibraryItem { Id = Guid.NewGuid(), Path = "/rec/a.ts" };
-        _host.Items.Add(item);
+        var item = _host.AddItem("/rec/a.ts", Start);
         var service = await RecordAiring(0, 20);
 
-        _clock.Advance(TimeSpan.FromHours(30));
-        await service.OnItemRemovedAsync(item.Id, CancellationToken.None);
+        Assert.True(await service.DismissAsync(item.Id, User, CancellationToken.None));
 
-        var data = ReadStore(StorePath);
-        Assert.Empty(data.Records);
-        Assert.Equal(CompleteShowingState.Scheduled, Assert.Single(data.Requests).State);
+        Assert.Empty(item.Tags);
+        Assert.Equal(CompleteShowingState.Dismissed, Assert.Single(Store.Requests).State);
+        Assert.Empty(await service.GetStatesAsync(new[] { item.Id }, User, CancellationToken.None));
     }
+
+    [Fact]
+    public async Task KeepAsCompleteLeavesAnExplicitRequestOpen()
+    {
+        _settings.AutoRecordComplete = false;
+        var airing = AddAiring("5e4d3c2b1a09f8e77d6c5b4a39281706", Start);
+        AddAiring("p2", Start.AddDays(1));
+        var item = _host.AddItem("/rec/a.ts", Start);
+        var timer = AddTimer(programId: airing.Id);
+        var service = NewService();
+        _clock.UtcNow = Start.AddMinutes(1);
+        await service.RequestCompleteShowingAsync(airing.Id, User, CancellationToken.None);
+        await RecordAiring(1, 20, timer: timer, service: service);
+
+        Assert.True(await service.DismissAsync(item.Id, User, CancellationToken.None));
+
+        Assert.Equal(CompleteShowingState.Scheduled, Assert.Single(Store.Requests).State);
+    }
+
+    // Storage and scheduling
 
     [Fact]
     public async Task TheStoreSurvivesARestart()
     {
         AddAiring("p2", Start.AddDays(1));
-        var item = new LibraryItem { Id = Guid.NewGuid(), Path = "/rec/a.ts" };
-        _host.Items.Add(item);
+        var item = _host.AddItem("/rec/a.ts", Start);
         await RecordAiring(0, 20);
 
-        var restarted = NewService();
-        var state = Assert.Single(await restarted.GetStatesAsync(new[] { item.Id }, CancellationToken.None));
+        var state = Assert.Single(await NewService().GetStatesAsync(new[] { item.Id }, User, CancellationToken.None));
         Assert.Equal("scheduled", state.State);
+    }
+
+    [Fact]
+    public async Task OldRecordsAndRequestsArePruned()
+    {
+        var item = _host.AddItem("/rec/a.ts", Start);
+        var service = await RecordAiring(0, 20);
+        await service.DismissAsync(item.Id, User, CancellationToken.None);
+
+        _clock.Advance(TimeSpan.FromDays(31));
+        await service.RunAsync(CancellationToken.None);
+
+        Assert.Empty(Store.Snapshots);
+        Assert.Empty(Store.Records);
+        Assert.Empty(Store.Requests);
     }
 
     [Fact]
